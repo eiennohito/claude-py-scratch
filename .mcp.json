@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "py-scratch": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "py-scratch"]
+    }
+  }
+}

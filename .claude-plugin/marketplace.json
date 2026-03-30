@@ -1,0 +1,13 @@
+{
+  "name": "py-scratch-marketplace",
+  "owner": {
+    "name": "Arseny Tolmachev"
+  },
+  "plugins": [
+    {
+      "name": "py-scratch",
+      "source": "./",
+      "description": "Python scratch file execution environment for Claude Code"
+    }
+  ]
+}

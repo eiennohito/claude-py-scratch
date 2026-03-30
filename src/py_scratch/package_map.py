@@ -1,0 +1,21 @@
+# import name -> PyPI package name for common mismatches
+IMPORT_TO_PYPI: dict[str, str] = {
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "yaml": "pyyaml",
+    "bs4": "beautifulsoup4",
+    "sklearn": "scikit-learn",
+    "skimage": "scikit-image",
+    "attr": "attrs",
+    "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "gi": "pygobject",
+    "google.cloud": "google-cloud",
+    "jwt": "pyjwt",
+    "lxml": "lxml",
+    "magic": "python-magic",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "wx": "wxpython",
+    "yaml": "pyyaml",
+}

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "py-scratch"
+version = "0.1.0"
+description = "Python execution MCP server for Claude Code"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+py-scratch = "py_scratch.__main__:main"
