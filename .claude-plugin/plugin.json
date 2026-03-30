@@ -1,7 +1,7 @@
 {
   "name": "py-scratch",
   "description": "Python scratch file execution environment for Claude Code. Replaces python -c with a proper run_python_script tool — no shell escaping, automatic dependency resolution, sandboxed execution, and persistent output.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": {
     "name": "Arseny Tolmachev"
   },

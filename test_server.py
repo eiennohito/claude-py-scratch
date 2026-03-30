@@ -223,9 +223,11 @@ def test_extract_project_name_missing(tmp_path):
 def test_build_command_with_project(tmp_path):
     orig_project = server_mod._PROJECT
     orig_extras = server_mod._EXTRA_PACKAGES
+    orig_pyver = server_mod._REQUIRES_PYTHON
     try:
         server_mod._PROJECT = tmp_path / "mylib"
         server_mod._EXTRA_PACKAGES = []
+        server_mod._REQUIRES_PYTHON = None
         cmd = _build_command(tmp_path / "script.py")
         assert cmd == [
             "uv", "run", "--quiet",
@@ -235,14 +237,38 @@ def test_build_command_with_project(tmp_path):
     finally:
         server_mod._PROJECT = orig_project
         server_mod._EXTRA_PACKAGES = orig_extras
+        server_mod._REQUIRES_PYTHON = orig_pyver
+
+
+def test_build_command_with_project_and_python(tmp_path):
+    orig_project = server_mod._PROJECT
+    orig_extras = server_mod._EXTRA_PACKAGES
+    orig_pyver = server_mod._REQUIRES_PYTHON
+    try:
+        server_mod._PROJECT = tmp_path / "mylib"
+        server_mod._EXTRA_PACKAGES = []
+        server_mod._REQUIRES_PYTHON = "3.14"
+        cmd = _build_command(tmp_path / "script.py")
+        assert cmd == [
+            "uv", "run", "--quiet",
+            "--project", str(tmp_path / "mylib"),
+            "--python", ">=3.14",
+            str(tmp_path / "script.py"),
+        ]
+    finally:
+        server_mod._PROJECT = orig_project
+        server_mod._EXTRA_PACKAGES = orig_extras
+        server_mod._REQUIRES_PYTHON = orig_pyver
 
 
 def test_build_command_with_project_and_extras(tmp_path):
     orig_project = server_mod._PROJECT
     orig_extras = server_mod._EXTRA_PACKAGES
+    orig_pyver = server_mod._REQUIRES_PYTHON
     try:
         server_mod._PROJECT = tmp_path / "main"
         server_mod._EXTRA_PACKAGES = [tmp_path / "extra1", tmp_path / "extra2"]
+        server_mod._REQUIRES_PYTHON = None
         cmd = _build_command(tmp_path / "script.py")
         assert cmd == [
             "uv", "run", "--quiet",
@@ -254,19 +280,23 @@ def test_build_command_with_project_and_extras(tmp_path):
     finally:
         server_mod._PROJECT = orig_project
         server_mod._EXTRA_PACKAGES = orig_extras
+        server_mod._REQUIRES_PYTHON = orig_pyver
 
 
 def test_build_command_bare(tmp_path):
     orig_project = server_mod._PROJECT
     orig_extras = server_mod._EXTRA_PACKAGES
+    orig_pyver = server_mod._REQUIRES_PYTHON
     try:
         server_mod._PROJECT = None
         server_mod._EXTRA_PACKAGES = []
+        server_mod._REQUIRES_PYTHON = None
         cmd = _build_command(tmp_path / "script.py")
         assert cmd == ["uv", "run", "--quiet", str(tmp_path / "script.py")]
     finally:
         server_mod._PROJECT = orig_project
         server_mod._EXTRA_PACKAGES = orig_extras
+        server_mod._REQUIRES_PYTHON = orig_pyver
 
 
 def test_tool_def_with_project(tmp_path):

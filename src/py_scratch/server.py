@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -15,6 +16,16 @@ except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[no-redef]
 
 from .package_map import IMPORT_TO_PYPI
+
+_log = logging.getLogger("py-scratch")
+
+
+def _setup_logging() -> None:
+    level = os.environ.get("PY_SCRATCH_LOG_LEVEL", "WARNING").upper()
+    _log.setLevel(getattr(logging, level, logging.WARNING))
+
+
+_setup_logging()
 
 _SCAN_SKIP = {".git", ".venv", "__pycache__", "node_modules", "build", "dist", ".tox", ".nox"}
 
@@ -90,23 +101,57 @@ def _extract_project_name(project_dir: Path) -> str | None:
         return None
 
 
+_REQUIRES_PYTHON_RE = re.compile(r">=\s*(\d+\.\d+(?:\.\d+)?)")
+
+
+def _extract_requires_python(project_dir: Path) -> str | None:
+    """Extract the minimum Python version from a project's requires-python."""
+    pp = project_dir / "pyproject.toml"
+    if not pp.exists():
+        return None
+    try:
+        data = tomllib.loads(pp.read_text(encoding="utf-8"))
+        spec = data.get("project", {}).get("requires-python", "")
+        m = _REQUIRES_PYTHON_RE.search(spec)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
 # --- Discovery results (computed once at import time) ---
 
 _DISCOVERED_PROJECTS = _find_projects(Path.cwd())
 _PROJECT, _EXTRA_PACKAGES = _load_local_packages()
-
+_REQUIRES_PYTHON = _extract_requires_python(_PROJECT) if _PROJECT else None
 
 def _session_dir() -> Path:
     cwd = os.getcwd()
     path_hash = hashlib.sha256(cwd.encode()).hexdigest()[:6]
     timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
     pid = os.getpid()
-    return Path(f"/tmp/pyscratch/workspace-{path_hash}/{timestamp}-{pid}")
+    if _PROJECT:
+        dir_name = _extract_project_name(_PROJECT) or _PROJECT.name
+    else:
+        dir_name = Path(cwd).name or "root"
+    return Path(f"/tmp/pyscratch/{dir_name}-{path_hash}/{timestamp}-{pid}")
 
 
 SESSION_DIR = _session_dir()
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
 STDOUT_FILE = "stdout.log"
 STDERR_FILE = "stderr.log"
+
+_log_handler = logging.FileHandler(SESSION_DIR / "server.log")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+_log.addHandler(_log_handler)
+
+_log.info("cwd: %s", Path.cwd())
+_log.info("discovered projects: %s", _DISCOVERED_PROJECTS)
+_log.info("selected project: %s", _PROJECT)
+_log.info("extra packages: %s", _EXTRA_PACKAGES)
+_log.info("requires-python: %s", _REQUIRES_PYTHON)
 _exec_counter = 0
 _active_procs: set[asyncio.subprocess.Process] = set()
 
@@ -139,12 +184,16 @@ def _write_script(path: Path, code: str, deps: list[str]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _build_command(script: Path) -> list[str]:
+def _build_command(script: Path, extra_deps: list[str] | None = None) -> list[str]:
     cmd = ["uv", "run", "--quiet"]
     if _PROJECT:
         cmd.extend(["--project", str(_PROJECT)])
+        if _REQUIRES_PYTHON:
+            cmd.extend(["--python", f">={_REQUIRES_PYTHON}"])
     for pkg in _EXTRA_PACKAGES:
         cmd.extend(["--with", str(pkg)])
+    for dep in extra_deps or []:
+        cmd.extend(["--with", dep])
     cmd.append(str(script))
     return cmd
 
@@ -187,9 +236,16 @@ async def _run_script(
     script = exec_dir / "script.py"
     stdout_path = exec_dir / STDOUT_FILE
     stderr_path = exec_dir / STDERR_FILE
-    _write_script(script, code, deps)
-
-    cmd = _build_command(script)
+    # When a project context is active, pass deps as --with flags so uv
+    # respects the project's requires-python instead of the hardcoded
+    # >=3.10 in PEP 723 inline metadata.
+    if _PROJECT:
+        _write_script(script, code, [])
+        cmd = _build_command(script, extra_deps=deps)
+    else:
+        _write_script(script, code, deps)
+        cmd = _build_command(script)
+    _log.info("exec %s: %s", execution_id, cmd)
     t0 = time.monotonic()
     with open(stdout_path, "wb") as out_f, open(stderr_path, "wb") as err_f:
         proc = await asyncio.create_subprocess_exec(
