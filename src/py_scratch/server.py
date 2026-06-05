@@ -184,7 +184,7 @@ def _write_script(path: Path, code: str, deps: list[str]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _build_command(script: Path, extra_deps: list[str] | None = None) -> list[str]:
+def _build_base_cmd() -> list[str]:
     cmd = ["uv", "run", "--quiet"]
     if _PROJECT:
         cmd.extend(["--project", str(_PROJECT)])
@@ -192,10 +192,62 @@ def _build_command(script: Path, extra_deps: list[str] | None = None) -> list[st
             cmd.extend(["--python", f">={_REQUIRES_PYTHON}"])
     for pkg in _EXTRA_PACKAGES:
         cmd.extend(["--with", str(pkg)])
+    return cmd
+
+
+def _build_command(*argv: str, extra_deps: list[str] | None = None) -> list[str]:
+    cmd = _build_base_cmd()
     for dep in extra_deps or []:
         cmd.extend(["--with", dep])
-    cmd.append(str(script))
+    cmd.extend(argv)
     return cmd
+
+
+_ENV_PRIME_TIMEOUT = 300
+
+_primed_deps: set[str] = set()
+
+# PEP 508 URL specifiers (e.g. "foo @ git+https://evil.com") let callers
+# install from arbitrary URLs. Block the two markers that distinguish a URL
+# specifier from a plain name+version constraint.
+_UNSAFE_DEP = re.compile(r"@|://")
+
+
+def _validate_deps(deps: list[str]) -> None:
+    for dep in deps:
+        if _UNSAFE_DEP.search(dep):
+            raise ValueError(f"Unsafe dependency specifier: {dep}")
+
+
+async def _ensure_env(deps: list[str]) -> None:
+    """Run a no-op script with --with flags to force uv to download and cache
+    the environment *before* the user's timeout starts. Without this, a first-time
+    large dep download (e.g. pyarrow, 46 MB) eats the script timeout and gets
+    killed, leaving the cache empty — every subsequent attempt fails the same way."""
+    new_deps = [d for d in deps if d not in _primed_deps]
+    if not new_deps:
+        return
+    cmd = _build_command("python3", "-c", "exit(0)", extra_deps=new_deps)
+    _log.info("priming env: %s", cmd)
+    t0 = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        cwd=os.getcwd(),
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_ENV_PRIME_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        _log.warning("env priming timed out after %ds for deps %s", _ENV_PRIME_TIMEOUT, new_deps)
+        return
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    if proc.returncode == 0:
+        _primed_deps.update(new_deps)
+        _log.info("env primed in %dms for deps %s", duration_ms, new_deps)
+    else:
+        _log.warning("env priming failed (exit %d) for deps %s: %s",
+                      proc.returncode, new_deps, stderr.decode(errors="replace")[-500:])
 
 
 def _preview(path: Path, head: int, tail: int) -> str:
@@ -236,15 +288,20 @@ async def _run_script(
     script = exec_dir / "script.py"
     stdout_path = exec_dir / STDOUT_FILE
     stderr_path = exec_dir / STDERR_FILE
-    # When a project context is active, pass deps as --with flags so uv
-    # respects the project's requires-python instead of the hardcoded
-    # >=3.10 in PEP 723 inline metadata.
+    _validate_deps(deps)
     if _PROJECT:
         _write_script(script, code, [])
-        cmd = _build_command(script, extra_deps=deps)
+        extra_deps = deps
     else:
         _write_script(script, code, deps)
-        cmd = _build_command(script)
+        extra_deps = []
+    # Only prime when deps are passed as --with flags (_PROJECT path).
+    # In the non-project path, deps are PEP 723 inline metadata in the script
+    # file itself, so uv resolves them differently and a --with prime would
+    # warm a different cache key.
+    if extra_deps:
+        await _ensure_env(extra_deps)
+    cmd = _build_command(str(script), extra_deps=extra_deps)
     _log.info("exec %s: %s", execution_id, cmd)
     t0 = time.monotonic()
     with open(stdout_path, "wb") as out_f, open(stderr_path, "wb") as err_f:
