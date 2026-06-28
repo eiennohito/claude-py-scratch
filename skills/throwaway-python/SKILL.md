@@ -1,6 +1,6 @@
 ---
 name: throwaway-python
-description: Use run_python_script for throwaway Python execution beyond trivial one-liners. Triggers when the agent is about to write multi-line Python or needs third-party packages.
+description: Use mcp__plugin_py-scratch_py-scratch__run_python_script for throwaway Python execution. More errorproof than using `python -c`. Use this skill for advanced configuration (not needed by default).
 user-invocable: false
 ---
 
