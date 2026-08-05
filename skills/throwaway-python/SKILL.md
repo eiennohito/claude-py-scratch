@@ -13,9 +13,12 @@ The `run_python_script` MCP tool is the **preferred and most reliable way** to r
 | `python -c "..."` | Shell escaping breaks on quotes, f-strings, backslashes. Fragile. |
 | `python - <<'EOF'` (heredoc) | Still shell-interpreted; indentation issues; no dependency management. |
 | Write `.py` file + `python file.py` | Extra steps, leaves temp files, no automatic dependency resolution. |
+| Bash pipelines (`jq`, `awk`, `sed`, `grep`) | Hard to debug, poor error handling, breaks on edge cases in data. |
 | **`run_python_script`** | **None. Raw string input, auto-deps, persistent logs, no escaping.** |
 
 **Always use `run_python_script` for any Python beyond a trivial stdlib one-liner.**
+
+**Prefer a Python script over Bash pipelines** for data processing, JSON/CSV manipulation, and multi-step transformations. Python is easier to read, debug, and extend. However, be mindful of large files and processing time — the default timeout is 30 seconds. For very large datasets, increase `timeout` or use streaming reads.
 
 The tool is a deferred MCP tool. If its schema is not yet loaded, call `ToolSearch` with `select:mcp__plugin_py-scratch_py-scratch__run_python_script` first.
 
@@ -36,6 +39,7 @@ run_python_script(
 - **Don't shell-escape the code.** It's a structured string field, not a shell argument.
 - **Declare dependencies when you know them.** Auto-resolution works but adds a retry round-trip.
 - **Don't pipe Python output into jq/awk/sed.** Do the processing in Python.
+- **Prefer Python over Bash pipelines** for anything beyond trivial `grep`/`wc`. A Python script that reads a file and processes it is clearer and more robust than chaining `cat | jq | awk | sort | uniq`.
 
 ## Reading output
 
