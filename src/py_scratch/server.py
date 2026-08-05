@@ -441,18 +441,23 @@ def _build_tool_def() -> dict:
             _extract_project_name(p) or p.name for p in _DISCOVERED_PROJECTS
         )
         desc += (
-            "\n\n⚠️ WARNING: THIS PLUGIN IS NOT CONFIGURED AND WILL NOT WORK CORRECTLY. "
-            f"Multiple Python projects were detected ({names}) but none is selected as the "
-            "execution context. The user MUST create a .py-scratch.json file in the working "
-            "directory to select a project. Example:\n"
-            '{"project": "./path-to-project", "packages": ["./optional-extra"]}\n'
-            "TELL THE USER ABOUT THIS. Scripts will run without project dependencies until configured."
+            f"\n\nMultiple Python projects detected ({names}), so no single project is "
+            "pre-loaded as the execution context. This is fine — declare any packages you "
+            "need in the dependencies array and they will be installed automatically."
         )
 
     return {
         "name": "run_python_script",
+        "title": "Run Python Script",
         "description": desc,
         "inputSchema": _TOOL_INPUT_SCHEMA,
+        "annotations": {
+            "title": "Run Python Script",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
     }
 
 
@@ -466,9 +471,9 @@ def _sync_handle(method: str, params: dict | None) -> dict | None:
     """Handle methods that don't need async."""
     if method == "initialize":
         return {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "py-scratch", "version": "0.1.0"},
+            "serverInfo": {"name": "py-scratch", "version": "0.5.0"},
         }
     if method == "notifications/initialized":
         return None

@@ -128,7 +128,7 @@ def test_preview_missing_file(tmp_path):
 
 def test_handle_initialize():
     r = _sync_handle("initialize", {})
-    assert r["protocolVersion"] == "2024-11-05"
+    assert r["protocolVersion"] == "2025-06-18"
     assert "tools" in r["capabilities"]
     assert r["serverInfo"]["name"] == "py-scratch"
 
@@ -328,10 +328,10 @@ def test_tool_def_multi_project_warning(tmp_path):
         server_mod._EXTRA_PACKAGES = []
         server_mod._DISCOVERED_PROJECTS = [tmp_path / "a", tmp_path / "b"]
         td = _build_tool_def()
-        assert "WARNING" in td["description"]
+        assert "Multiple" in td["description"]
         assert "pkg-a" in td["description"]
         assert "pkg-b" in td["description"]
-        assert ".py-scratch.json" in td["description"]
+        assert "dependencies" in td["description"]
     finally:
         server_mod._PROJECT = orig_project
         server_mod._EXTRA_PACKAGES = orig_extras
