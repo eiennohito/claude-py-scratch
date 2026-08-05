@@ -18,7 +18,9 @@ The `run_python_script` MCP tool is the **preferred and most reliable way** to r
 
 **Always use `run_python_script` for any Python beyond a trivial stdlib one-liner.**
 
-**Prefer a Python script over Bash pipelines** for data processing, JSON/CSV manipulation, and multi-step transformations. Python is easier to read, debug, and extend. However, be mindful of large files and processing time — the default timeout is 30 seconds. For very large datasets, increase `timeout` or use streaming reads.
+**Prefer a Python script over Bash pipelines** for data processing, JSON/CSV manipulation, and multi-step transformations. Python is easier to read, debug, and extend.
+
+**Performance matters.** Modern hardware processes gigabytes per second — a 100 MB file should take seconds, not minutes. Use efficient libraries (polars/pyarrow for tabular data, orjson for JSON) and columnar reads over row-by-row loops. If Python is genuinely the wrong tool for the job (e.g. massive line-oriented filtering where `rg`/`awk` saturates I/O), use the right tool instead.
 
 The tool is a deferred MCP tool. If its schema is not yet loaded, call `ToolSearch` with `select:mcp__plugin_py-scratch_py-scratch__run_python_script` first.
 
