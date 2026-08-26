@@ -836,6 +836,115 @@ def test_clear_is_followed_exactly(tmp_path):
             os.environ.pop(var, None)
 
 
+# --- multi-user safety: per-user roots, verified dirs, trusted handoffs ---
+
+def test_scratch_root_is_per_user_and_survives_logout():
+    if os.name != "posix":
+        return
+    root = server_mod._scratch_root()
+    # never XDG_RUNTIME_DIR: artifacts must outlive the login session
+    assert root.name == f"pyscratch-{os.getuid()}"
+    assert "XDG_RUNTIME_DIR" not in str(root) or not os.environ.get("XDG_RUNTIME_DIR")
+
+
+def test_handoff_root_prefers_xdg_runtime_dir(tmp_path):
+    if os.name != "posix":
+        return
+    old = os.environ.get("XDG_RUNTIME_DIR")
+    try:
+        os.environ["XDG_RUNTIME_DIR"] = str(tmp_path)
+        assert server_mod._handoff_root() == tmp_path / "pyscratch"
+        # scratch root must NOT follow it
+        assert server_mod._scratch_root().name == f"pyscratch-{os.getuid()}"
+        os.environ.pop("XDG_RUNTIME_DIR")
+        assert server_mod._handoff_root() == server_mod._scratch_root()
+    finally:
+        if old is not None:
+            os.environ["XDG_RUNTIME_DIR"] = old
+        else:
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+
+
+def test_hook_and_server_agree_on_roots():
+    hook = _load_hook()
+    assert hook._scratch_root() == server_mod._scratch_root()
+    assert hook._handoff_root() == server_mod._handoff_root()
+
+
+def test_secure_mkdir_creates_private_dir(tmp_path):
+    d = server_mod._secure_mkdir(tmp_path / "root")
+    assert d == tmp_path / "root"
+    if os.name == "posix":
+        assert (os.lstat(d).st_mode & 0o777) == 0o700
+
+
+def test_secure_mkdir_rejects_symlink(tmp_path):
+    if os.name != "posix":
+        return
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert server_mod._secure_mkdir(link) is None
+
+
+def test_secure_mkdir_strips_group_other_bits(tmp_path):
+    if os.name != "posix":
+        return
+    d = tmp_path / "loose"
+    d.mkdir()
+    os.chmod(d, 0o777)
+    assert server_mod._secure_mkdir(d) == d
+    assert (os.lstat(d).st_mode & 0o777) == 0o700
+
+
+def test_read_trusted_json_accepts_own_private_file(tmp_path):
+    p = tmp_path / "h.json"
+    p.write_text('{"a": 1}')
+    os.chmod(p, 0o600)
+    assert server_mod._read_trusted_json(p) == {"a": 1}
+
+
+def test_read_trusted_json_rejects_group_writable(tmp_path):
+    if os.name != "posix":
+        return
+    p = tmp_path / "h.json"
+    p.write_text('{"a": 1}')
+    os.chmod(p, 0o666)
+    assert server_mod._read_trusted_json(p) is None
+
+
+def test_read_trusted_json_rejects_symlink(tmp_path):
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        return
+    p = tmp_path / "h.json"
+    p.write_text('{"a": 1}')
+    os.chmod(p, 0o600)
+    link = tmp_path / "link.json"
+    link.symlink_to(p)
+    assert server_mod._read_trusted_json(link) is None
+
+
+def test_read_trusted_json_missing_file(tmp_path):
+    assert server_mod._read_trusted_json(tmp_path / "nope.json") is None
+
+
+def test_hook_writes_private_handoff(tmp_path):
+    hook = _load_hook()
+    os.environ["PY_SCRATCH_HANDOFF_DIR"] = str(tmp_path / "handoff")
+    try:
+        hook.write_handoff({"session_id": "s"}, 1234, 5678)
+        target = tmp_path / "handoff" / "1234-5678.json"
+        assert json.loads(target.read_text()) == {"session_id": "s"}
+        if os.name == "posix":
+            assert (os.lstat(target).st_mode & 0o077) == 0
+        # overwrite (same instance re-fires on /clear) must also work
+        hook.write_handoff({"session_id": "s2"}, 1234, 5678)
+        assert json.loads(target.read_text()) == {"session_id": "s2"}
+    finally:
+        os.environ.pop("PY_SCRATCH_HANDOFF_DIR", None)
+
+
 if __name__ == "__main__":
     import asyncio
     import inspect

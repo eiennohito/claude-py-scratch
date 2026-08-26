@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -148,6 +149,57 @@ _REQUIRES_PYTHON = _extract_requires_python(_PROJECT) if _PROJECT else None
 _RUN_ID = f"{time.strftime('%Y-%m-%d-%H-%M-%S')}-{os.getpid()}"
 
 
+def _scratch_root() -> Path:
+    """Artifact/log root, keyed by uid because /tmp is shared across users.
+    Not $XDG_RUNTIME_DIR — artifacts should survive logout for debugging.
+    Windows's temp dir is per-user already."""
+    if os.name == "posix":
+        return Path(tempfile.gettempdir()) / f"pyscratch-{os.getuid()}"
+    return Path(tempfile.gettempdir()) / "pyscratch"
+
+
+def _handoff_root() -> Path:
+    """Handoff root; must mirror the hook exactly. $XDG_RUNTIME_DIR fits the
+    handoff's session lifetime and is kernel-guaranteed private."""
+    if os.name == "posix":
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg and Path(xdg).is_dir():
+            return Path(xdg) / "pyscratch"
+    return _scratch_root()
+
+
+def _secure_mkdir(path: Path) -> Path | None:
+    """Create `path` 0700 and verify it is a real directory owned by us:
+    reject symlinks and squatted dirs, strip group/other bits."""
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    if os.name != "posix":
+        return path
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return None
+        if st.st_mode & 0o077:
+            os.chmod(path, 0o700)
+    except OSError:
+        return None
+    return path
+
+
+def _init_user_root() -> Path:
+    root = _scratch_root()
+    if _secure_mkdir(root) is None:
+        # Only log privacy is at stake (the handoff is verified separately);
+        # a findable path beats a random one, so warn and keep it.
+        _log.warning("scratch root %s failed the ownership check; using it anyway", root)
+    return root
+
+
+_USER_ROOT = _init_user_root()
+
+
 def _session_dir() -> Path:
     """Process-scoped fallback location for artifacts, used when no Claude Code
     scratchpad is available. Stable for the lifetime of the server."""
@@ -157,7 +209,7 @@ def _session_dir() -> Path:
         dir_name = _extract_project_name(_PROJECT) or _PROJECT.name
     else:
         dir_name = Path(cwd).name or "root"
-    return Path(tempfile.gettempdir()) / "pyscratch" / f"{dir_name}-{path_hash}" / _RUN_ID
+    return _USER_ROOT / f"{dir_name}-{path_hash}" / _RUN_ID
 
 
 def _slugify_cwd(cwd: str) -> str:
@@ -200,7 +252,34 @@ def _handoff_dir() -> Path:
     override = os.environ.get("PY_SCRATCH_HANDOFF_DIR")
     if override:
         return Path(override)
-    return Path(tempfile.gettempdir()) / "pyscratch" / "handoff"
+    return _handoff_root() / "handoff"
+
+
+def _read_trusted_json(path: Path) -> dict | None:
+    """Read JSON only from a file no other user could have planted: no
+    symlinks, owned by us, not group/other-writable. A spoofed handoff would
+    mean executing a script.py someone else can swap."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        return None
+    try:
+        fh = os.fdopen(fd, "r", encoding="utf-8")
+    except OSError:
+        os.close(fd)
+        return None
+    with fh:
+        try:
+            if os.name == "posix":
+                st = os.fstat(fh.fileno())
+                if st.st_uid != os.getuid() or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    _log.warning("ignoring handoff %s: not exclusively ours", path)
+                    return None
+            data = json.loads(fh.read())
+        except (OSError, json.JSONDecodeError):
+            return None
+    return data if isinstance(data, dict) else None
 
 
 def _read_handoff() -> dict | None:
@@ -209,12 +288,7 @@ def _read_handoff() -> dict | None:
     if found is None:
         return None
     claude_pid, starttime = found
-    path = _handoff_dir() / f"{claude_pid}-{starttime}.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    return _read_trusted_json(_handoff_dir() / f"{claude_pid}-{starttime}.json")
 
 
 def _guess_session_dir() -> Path | None:
@@ -292,15 +366,22 @@ _config = _read_config() or {}
 _CONFIG_SCRATCH_DIR = _config.get("scratch_dir")
 
 SESSION_DIR = _session_dir()
-SESSION_DIR.mkdir(parents=True, exist_ok=True)
+# Import-time: degrade to no file logging rather than not starting.
+try:
+    SESSION_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+except OSError:
+    pass
 STDOUT_FILE = "stdout.log"
 STDERR_FILE = "stderr.log"
 SERVER_LOG = SESSION_DIR / "server.log"
 SERVER_STDERR_LOG = SESSION_DIR / "server-stderr.log"
 
-_log_handler = logging.FileHandler(SERVER_LOG)
-_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-_log.addHandler(_log_handler)
+try:
+    _log_handler = logging.FileHandler(SERVER_LOG)
+    _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _log.addHandler(_log_handler)
+except OSError:
+    pass
 
 
 class _StderrTee:
@@ -393,7 +474,7 @@ def _exec_dir() -> tuple[str, Path]:
     for base in (_artifact_root(), SESSION_DIR):
         d = base / eid
         try:
-            d.mkdir(parents=True, exist_ok=True)
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
             return eid, d
         except OSError as exc:
             _log.warning("cannot create exec dir %s (%s), falling back", d, exc)
@@ -895,7 +976,7 @@ def _sync_handle(method: str, params: dict | None) -> dict | None:
         return {
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "py-scratch", "version": "0.6.0"},
+            "serverInfo": {"name": "py-scratch", "version": "0.7.0"},
         }
     if method == "notifications/initialized":
         return None

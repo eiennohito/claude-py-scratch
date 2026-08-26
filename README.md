@@ -71,8 +71,8 @@ Returns:
   "duration_ms": 457,
   "stdout_preview": "...",
   "stderr_preview": "",
-  "stdout_path": "/tmp/pyscratch/myproj-a1b2c3/2026-08-26-14-27-13-3513357/0007/stdout.log",
-  "stderr_path": "/tmp/pyscratch/myproj-a1b2c3/2026-08-26-14-27-13-3513357/0007/stderr.log"
+  "stdout_path": "/tmp/pyscratch-1000/myproj-a1b2c3/2026-08-26-14-27-13-3513357/0007/stdout.log",
+  "stderr_path": "/tmp/pyscratch-1000/myproj-a1b2c3/2026-08-26-14-27-13-3513357/0007/stderr.log"
 }
 ```
 
@@ -144,9 +144,21 @@ Resolved per call, first match wins:
 3. **The Claude Code session directory**, when running under Claude Code:
    `<session scratchpad>/py-scratch/{run_id}/` — so script output lands beside the
    session's other working files and is cleaned up with them
-4. `{tmpdir}/pyscratch/{project}-{hash}/{run_id}/`
+4. `{user root}/{project}-{hash}/{run_id}/`
 
 Set `PY_SCRATCH_USE_SCRATCHPAD=0` to always use the temp directory.
+
+`{user root}` is per-user, because `/tmp` is shared on multi-user machines and a
+fixed `/tmp/pyscratch` would belong to whoever created it first — breaking the plugin
+for everyone else and letting them tamper with scripts before they run. It is
+`{tmpdir}/pyscratch-{uid}` on POSIX and `{tmpdir}/pyscratch` on Windows (whose temp
+dir is per-user). Deliberately not `$XDG_RUNTIME_DIR`: that is wiped on the user's
+last logout, and artifacts are what you come back to when debugging — `/tmp`'s
+until-reboot lifetime fits better. The directory is created `0700` and verified to be
+a real directory owned by the current user. If that check fails the path is still
+used (with a logged warning): the handoff — the input that decides what gets
+executed — is verified separately, so what remains at stake here is log privacy, and
+a deterministic path you can find after the session is worth more than that.
 
 #### How the session is identified
 
@@ -161,15 +173,26 @@ So the plugin ships a `SessionStart` hook (`hooks/scratchpad_handoff.py`) that d
 get the real session id. It records it in
 
 ```
-{tmpdir}/pyscratch/handoff/{claude_pid}-{claude_starttime}.json
+{handoff root}/handoff/{claude_pid}-{claude_starttime}.json
 ```
+
+`{handoff root}` is `$XDG_RUNTIME_DIR/pyscratch` when available, falling back to
+`{user root}`. Unlike artifacts, a handoff is only meaningful while its Claude Code
+process is alive, so the runtime dir's logout lifetime is the right one — and it is
+kernel-guaranteed per-user and `0700`.
 
 keyed by the owning Claude Code process, located by **walking the process tree**
 rather than trusting an environment variable. The MCP server walks up from itself to
 the same process and reads the same key, so both sides agree exactly — including
 across `/clear`, `resume` and `compact`. `starttime` (field 22 of `/proc/<pid>/stat`)
 disambiguates a recycled pid; `SessionEnd` removes the file, and stale entries are
-pruned on the next `SessionStart`.
+pruned on the next `SessionStart`. Per-pid keys also mean any number of concurrent
+Claude Code instances of the same user coexist without stepping on each other.
+
+The handoff decides where the server writes — and then executes — `script.py`, so it
+is only trusted when it could not have been planted: the hook writes it `0600` inside
+the private per-user root, and the server refuses a handoff file that is a symlink,
+owned by someone else, or writable by group/other.
 
 The hook prints nothing and always exits 0 — if anything goes wrong it simply falls
 back to the environment/mtime heuristic. Installing the MCP server without the plugin
@@ -184,7 +207,7 @@ Server-level diagnostics stay in the temp directory for the life of the process,
 since they outlive any one session:
 
 ```
-{tmpdir}/pyscratch/{project}-{hash}/{run_id}/
+{user root}/{project}-{hash}/{run_id}/
   server.log          # server events, warnings, handler tracebacks
   server-stderr.log   # everything the process wrote to stderr
 ```

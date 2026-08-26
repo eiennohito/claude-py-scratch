@@ -22,12 +22,51 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 HANDOFF_VERSION = 1
+
+
+def _scratch_root() -> Path:
+    """Artifact root, keyed by uid because /tmp is shared across users;
+    must mirror server.py exactly."""
+    if os.name == "posix":
+        return Path(tempfile.gettempdir()) / f"pyscratch-{os.getuid()}"
+    return Path(tempfile.gettempdir()) / "pyscratch"
+
+
+def _handoff_root() -> Path:
+    """Handoff root; must mirror server.py exactly. $XDG_RUNTIME_DIR fits the
+    handoff's session lifetime and is kernel-guaranteed private."""
+    if os.name == "posix":
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg and Path(xdg).is_dir():
+            return Path(xdg) / "pyscratch"
+    return _scratch_root()
+
+
+def _secure_mkdir(path: Path) -> Path | None:
+    """Create `path` 0700 and verify it is a real directory owned by us:
+    reject symlinks and squatted dirs, strip group/other bits."""
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    if os.name != "posix":
+        return path
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return None
+        if st.st_mode & 0o077:
+            os.chmod(path, 0o700)
+    except OSError:
+        return None
+    return path
 
 
 def _stat_fields(pid: int) -> list[str]:
@@ -79,7 +118,24 @@ def handoff_dir() -> Path:
     override = os.environ.get("PY_SCRATCH_HANDOFF_DIR")
     if override:
         return Path(override)
-    return Path(tempfile.gettempdir()) / "pyscratch" / "handoff"
+    return _handoff_root() / "handoff"
+
+
+def _ensure_handoff_dir() -> Path | None:
+    """Create the handoff dir, refusing locations another user could tamper with."""
+    override = os.environ.get("PY_SCRATCH_HANDOFF_DIR")
+    if override:
+        # An explicit override is the operator's choice; just create it.
+        p = Path(override)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return p
+    root = _secure_mkdir(_handoff_root())
+    if root is None:
+        return None
+    return _secure_mkdir(root / "handoff")
 
 
 def handoff_path(claude_pid: int, starttime: int) -> Path:
@@ -130,11 +186,18 @@ def prune_stale() -> None:
 
 
 def write_handoff(payload: dict, claude_pid: int, starttime: int) -> None:
-    target = handoff_path(claude_pid, starttime)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic replace: the server may read this at any moment.
+    directory = _ensure_handoff_dir()
+    if directory is None:
+        return
+    target = directory / f"{claude_pid}-{starttime}.json"
+    # Atomic replace: the server may read this at any moment. 0600 + O_NOFOLLOW
+    # so the server's trust checks accept it; pid in the tmp name so concurrent
+    # instances never collide.
     tmp_path = target.with_suffix(f".{os.getpid()}.tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(tmp_path), flags, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, indent=2))
     os.replace(tmp_path, target)
 
 
