@@ -4,7 +4,9 @@
 # ///
 """Smoke tests for py-scratch."""
 
+import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -356,6 +358,484 @@ def test_py_scratch_json_override(tmp_path):
 
 
 # --- runner ---
+# --- protocol robustness: a request must always get exactly one response ---
+
+def _collect_responses():
+    """Patch the writer so handler output can be inspected without stdout."""
+    sent = []
+
+    async def _capture(message):
+        sent.append(message)
+
+    server_mod._write_message = _capture
+    return sent
+
+
+async def test_tool_call_with_wrong_arg_name_still_responds():
+    # Regression: fable sent {"script": ...} instead of {"code": ...}. That raised
+    # TypeError inside the handler task, no response was ever written, and the
+    # client hung until its 30-minute idle abort.
+    sent = _collect_responses()
+    await server_mod._handle_tool_call(1, {
+        "name": "run_python_script",
+        "arguments": {"script": "print('aliased')"},
+    })
+    assert len(sent) == 1
+    assert sent[0]["id"] == 1
+    body = json.loads(sent[0]["result"]["content"][0]["text"])
+    assert body["exit_code"] == 0
+    assert "aliased" in body["stdout_preview"]
+    assert any("script" in n and "code" in n for n in body["argument_notes"])
+
+
+async def test_tool_call_missing_code_responds_with_error():
+    sent = _collect_responses()
+    await server_mod._handle_tool_call(2, {"name": "run_python_script", "arguments": {"intent": "x"}})
+    assert len(sent) == 1
+    assert sent[0]["result"]["isError"] is True
+    assert "code" in sent[0]["result"]["content"][0]["text"]
+
+
+async def test_tool_call_unknown_tool_responds():
+    sent = _collect_responses()
+    await server_mod._handle_tool_call(3, {"name": "nope", "arguments": {}})
+    assert len(sent) == 1
+    assert sent[0]["result"]["isError"] is True
+
+
+async def test_tool_call_responds_even_when_execution_raises():
+    sent = _collect_responses()
+    original = server_mod.run_python_script
+
+    async def _boom(**kwargs):
+        raise RuntimeError("simulated internal failure")
+
+    server_mod.run_python_script = _boom
+    try:
+        await server_mod._handle_tool_call(4, {
+            "name": "run_python_script",
+            "arguments": {"intent": "x", "code": "print(1)"},
+        })
+    finally:
+        server_mod.run_python_script = original
+    assert len(sent) == 1
+    assert sent[0]["result"]["isError"] is True
+    assert "simulated internal failure" in sent[0]["result"]["content"][0]["text"]
+
+
+async def test_tool_call_bad_arguments_type_responds():
+    sent = _collect_responses()
+    await server_mod._handle_tool_call(5, {"name": "run_python_script", "arguments": "oops"})
+    assert len(sent) == 1
+    assert sent[0]["result"]["isError"] is True
+
+
+def test_coerce_args_aliases_and_unknowns():
+    clean, notes = server_mod._coerce_args({"script": "print(1)", "bogus": 1})
+    assert clean["code"] == "print(1)"
+    assert clean["intent"]
+    assert any("bogus" in n for n in notes)
+
+
+def test_coerce_args_keeps_explicit_over_alias():
+    clean, notes = server_mod._coerce_args({"code": "a", "script": "b", "intent": "i"})
+    assert clean["code"] == "a"
+    assert any("script" in n for n in notes)
+
+
+# --- child process robustness ---
+
+def test_describe_exit_classifications():
+    assert server_mod._describe_exit(0, False, 30)[0] == "ok"
+    assert server_mod._describe_exit(1, False, 30)[0] == "failed"
+    assert server_mod._describe_exit(-9, False, 30)[0] == "crashed"
+    assert "SIGKILL" in server_mod._describe_exit(-9, False, 30)[1]
+    assert server_mod._describe_exit(-9, True, 30)[0] == "timeout"
+    assert server_mod._describe_exit(None, False, 30)[0] == "not_started"
+
+
+async def test_timeout_is_reported_as_timeout_not_crash():
+    r = await run_python_script(intent="hang", code="import time; time.sleep(30)", timeout=2)
+    assert r["status"] == "timeout"
+    assert "timeout" in r["explanation"]
+
+
+async def test_signal_death_is_reported_as_crash():
+    r = await run_python_script(
+        intent="crash", code="import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+    )
+    assert r["status"] == "crashed"
+    assert "SIGKILL" in r["explanation"]
+
+
+async def test_crash_with_output_is_not_retried():
+    r = await run_python_script(
+        intent="crash after output",
+        code="import os, signal, sys; print('side effect'); sys.stdout.flush();"
+             " os.kill(os.getpid(), signal.SIGKILL)",
+    )
+    assert r["status"] == "crashed"
+    assert "crash_retry_of" not in r
+
+
+def test_normalise_args_coerces_loose_types():
+    intent, code, deps, timeout, head, tail = server_mod._normalise_args(
+        None, "print(1)", "httpx", "45", None, "3"
+    )
+    assert intent == ""
+    assert deps == ["httpx"]
+    assert timeout == 45
+    assert head == 0
+    assert tail == 3
+
+
+def test_normalise_args_clamps_nonsense():
+    _, _, _, timeout, _, _ = server_mod._normalise_args("i", "c", [], -5, 0, 5)
+    assert timeout == 1
+
+
+def test_read_log_survives_bad_encoding(tmp_path):
+    p = tmp_path / "out.log"
+    p.write_bytes(b"ok \xff\xfe broken")
+    assert "ok" in server_mod._read_log(p)
+
+
+def test_find_projects_survives_unreadable_dir(tmp_path):
+    # An unreadable directory in the scan path used to raise PermissionError out of
+    # import time, so the server never started at all.
+    _make_project(tmp_path / "lib")
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "sub").mkdir()
+    blocked.chmod(0o000)
+    try:
+        found = _find_projects(tmp_path)
+    finally:
+        blocked.chmod(0o755)
+    assert (tmp_path / "lib") in found
+
+
+# --- artifact location ---
+
+_ORIG_READ_HANDOFF = server_mod._read_handoff
+_ORIG_FIND_CLAUDE = server_mod._find_claude_process
+
+
+def _restore_server_probes():
+    server_mod._read_handoff = _ORIG_READ_HANDOFF
+    server_mod._find_claude_process = _ORIG_FIND_CLAUDE
+
+
+def _no_handoff():
+    """Force the env-based fallback path (no hook installed)."""
+    server_mod._read_handoff = lambda: None
+
+
+def test_scratchpad_used_when_present(tmp_path):
+    _no_handoff()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    tmp = tmp_path / "tmproot"
+    session = "sess-123"
+    pad = tmp / f"claude-{os.getuid()}" / server_mod._slugify_cwd(str(cwd)) / session / "scratchpad"
+    pad.mkdir(parents=True)
+
+    old_cwd = os.getcwd()
+    os.chdir(cwd)
+    os.environ["CLAUDE_CODE_TMPDIR"] = str(tmp)
+    os.environ["CLAUDE_CODE_SESSION_ID"] = session
+    try:
+        assert server_mod._claude_scratchpad() == pad
+        assert str(server_mod._artifact_root()).startswith(str(pad))
+    finally:
+        _restore_server_probes()
+        os.chdir(old_cwd)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+
+
+def test_sits_beside_scratchpad_when_claude_has_not_created_it(tmp_path):
+    # Claude Code creates <session>/scratchpad lazily with a non-recursive mkdir, so
+    # creating it ourselves could make its own mkdir fail with EEXIST.
+    _no_handoff()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    tmp = tmp_path / "tmproot"
+    session = "sess-nopad"
+    session_dir = tmp / f"claude-{os.getuid()}" / server_mod._slugify_cwd(str(cwd)) / session
+    session_dir.mkdir(parents=True)
+
+    old_cwd = os.getcwd()
+    os.chdir(cwd)
+    os.environ["CLAUDE_CODE_TMPDIR"] = str(tmp)
+    os.environ["CLAUDE_CODE_SESSION_ID"] = session
+    try:
+        assert server_mod._claude_scratchpad() == session_dir
+        assert not (session_dir / "scratchpad").exists()
+    finally:
+        _restore_server_probes()
+        os.chdir(old_cwd)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+
+
+def test_falls_back_to_newest_when_session_id_is_stale(tmp_path):
+    _no_handoff()
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    tmp = tmp_path / "tmproot"
+    root = tmp / f"claude-{os.getuid()}" / server_mod._slugify_cwd(str(cwd))
+    old_pad = root / "dead-session" / "scratchpad"
+    new_pad = root / "live-session" / "scratchpad"
+    old_pad.mkdir(parents=True)
+    new_pad.mkdir(parents=True)
+    os.utime(old_pad.parent, (1, 1))
+
+    old_cwd = os.getcwd()
+    os.chdir(cwd)
+    os.environ["CLAUDE_CODE_TMPDIR"] = str(tmp)
+    os.environ["CLAUDE_CODE_SESSION_ID"] = "gone-after-clear"
+    try:
+        assert server_mod._claude_scratchpad() == new_pad
+    finally:
+        _restore_server_probes()
+        os.chdir(old_cwd)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+
+
+# --- hook handoff: exact session identity instead of a guess ---
+
+def _load_hook():
+    import importlib.util
+    hook_path = Path(__file__).parent / "hooks" / "scratchpad_handoff.py"
+    spec = importlib.util.spec_from_file_location("scratchpad_handoff", hook_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_hook_finds_this_process_tree():
+    hook = _load_hook()
+    # The test itself runs under some ancestor; whatever the walk returns must be a
+    # live process whose starttime matches, or None when not run under Claude Code.
+    found = hook.find_claude_process()
+    if found is None:
+        return
+    pid, starttime = found
+    assert hook._comm(pid) == "claude"
+    assert hook._starttime(pid) == starttime
+
+
+def test_hook_walk_stops_cleanly_on_bogus_pid():
+    hook = _load_hook()
+    assert hook.find_claude_process(start=999999999) is None
+
+
+def test_hook_writes_handoff_and_server_reads_it(tmp_path):
+    hook = _load_hook()
+    handoff_dir = tmp_path / "handoff"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    tmp = tmp_path / "tmproot"
+    session = "hook-session"
+    pad = tmp / f"claude-{os.getuid()}" / str(cwd).replace(os.sep, "-") / session / "scratchpad"
+    pad.mkdir(parents=True)
+
+    os.environ["PY_SCRATCH_HANDOFF_DIR"] = str(handoff_dir)
+    os.environ["CLAUDE_CODE_TMPDIR"] = str(tmp)
+    try:
+        # Pretend this very process is the Claude Code process, so the test does not
+        # depend on actually running under one.
+        fake = (os.getpid(), hook._starttime(os.getpid()))
+        hook.find_claude_process = lambda start=None: fake
+        hook.write_handoff(
+            {"session_id": session, "cwd": str(cwd), **hook.session_paths(session, str(cwd))},
+            *fake,
+        )
+
+        server_mod._find_claude_process = lambda: fake
+        data = server_mod._read_handoff()
+        assert data["session_id"] == session
+        assert server_mod._claude_scratchpad() == pad
+    finally:
+        _restore_server_probes()
+        os.environ.pop("PY_SCRATCH_HANDOFF_DIR", None)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
+
+
+def test_handoff_beats_a_stale_env_session_id(tmp_path):
+    # The whole point: env says one session, the hook knows the real one.
+    hook = _load_hook()
+    handoff_dir = tmp_path / "handoff"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    tmp = tmp_path / "tmproot"
+    root = tmp / f"claude-{os.getuid()}" / str(cwd).replace(os.sep, "-")
+    (root / "stale-session" / "scratchpad").mkdir(parents=True)
+    real_pad = root / "real-session" / "scratchpad"
+    real_pad.mkdir(parents=True)
+    # Make the stale one look newest, so any mtime heuristic would pick it.
+    os.utime(root / "stale-session", None)
+
+    os.environ["PY_SCRATCH_HANDOFF_DIR"] = str(handoff_dir)
+    os.environ["CLAUDE_CODE_TMPDIR"] = str(tmp)
+    os.environ["CLAUDE_CODE_SESSION_ID"] = "stale-session"
+    try:
+        fake = (os.getpid(), hook._starttime(os.getpid()))
+        hook.write_handoff(
+            {"session_id": "real-session", "cwd": str(cwd),
+             **hook.session_paths("real-session", str(cwd))},
+            *fake,
+        )
+        server_mod._find_claude_process = lambda: fake
+        assert server_mod._claude_scratchpad() == real_pad
+    finally:
+        _restore_server_probes()
+        os.environ.pop("PY_SCRATCH_HANDOFF_DIR", None)
+        os.environ.pop("CLAUDE_CODE_TMPDIR", None)
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+
+
+def test_hook_prunes_handoffs_for_dead_processes(tmp_path):
+    hook = _load_hook()
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    (handoff_dir / "999999999-12345.json").write_text("{}")
+    os.environ["PY_SCRATCH_HANDOFF_DIR"] = str(handoff_dir)
+    try:
+        hook.prune_stale()
+        assert not (handoff_dir / "999999999-12345.json").exists()
+    finally:
+        os.environ.pop("PY_SCRATCH_HANDOFF_DIR", None)
+
+
+def test_hook_script_runs_end_to_end(tmp_path):
+    import subprocess
+    hook_path = Path(__file__).parent / "hooks" / "scratchpad-handoff.sh"
+    env = dict(os.environ)
+    env["PY_SCRATCH_HANDOFF_DIR"] = str(tmp_path / "handoff")
+    env["CLAUDE_CODE_TMPDIR"] = str(tmp_path / "tmproot")
+    event = json.dumps({
+        "hook_event_name": "SessionStart", "source": "clear",
+        "session_id": "e2e-session", "cwd": str(tmp_path),
+    })
+    r = subprocess.run([str(hook_path)], input=event, capture_output=True, text=True, env=env)
+    assert r.returncode == 0
+    # Must stay silent: UserPromptSubmit-style stdout would be injected as context.
+    assert r.stdout == ""
+    written = list((tmp_path / "handoff").glob("*.json")) if (tmp_path / "handoff").exists() else []
+    if written:  # only when running under a real claude process
+        data = json.loads(written[0].read_text())
+        assert data["session_id"] == "e2e-session"
+
+
+def test_hook_survives_garbage_stdin():
+    import subprocess
+    hook_path = Path(__file__).parent / "hooks" / "scratchpad-handoff.sh"
+    r = subprocess.run([str(hook_path)], input="not json at all",
+                       capture_output=True, text=True)
+    assert r.returncode == 0
+    assert r.stdout == ""
+
+
+def test_scratchpad_disabled_by_env(tmp_path):
+    os.environ["PY_SCRATCH_USE_SCRATCHPAD"] = "0"
+    try:
+        assert server_mod._claude_scratchpad() is None
+    finally:
+        os.environ.pop("PY_SCRATCH_USE_SCRATCHPAD", None)
+
+
+def test_py_scratch_dir_env_overrides(tmp_path):
+    os.environ["PY_SCRATCH_DIR"] = str(tmp_path / "custom")
+    try:
+        assert str(server_mod._artifact_root()).startswith(str(tmp_path / "custom"))
+    finally:
+        os.environ.pop("PY_SCRATCH_DIR", None)
+
+
+async def test_timeout_kills_the_grandchild_interpreter():
+    # The direct child is `uv run`; the interpreter running the script is its child.
+    # Killing only uv would leave that interpreter alive forever.
+    r = await run_python_script(
+        intent="orphan check",
+        code="import os, sys, time; print(os.getpid()); sys.stdout.flush(); time.sleep(120)",
+        timeout=3,
+    )
+    assert r["status"] == "timeout"
+    child_pid = int(r["stdout_preview"].strip().split("\n")[0])
+    await asyncio.sleep(0.5)
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        return
+    raise AssertionError(f"interpreter {child_pid} survived the timeout kill")
+
+
+async def test_crash_with_no_output_is_retried_once():
+    r = await run_python_script(
+        intent="silent crash",
+        code="import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
+    )
+    assert r["status"] == "crashed"
+    assert "crash_retry_of" in r
+    assert "reproduced on retry" in r["explanation"]
+
+
+def test_clear_is_followed_exactly(tmp_path):
+    """The incident case: /clear starts a new session inside the same process, so
+    the MCP server's CLAUDE_CODE_SESSION_ID goes stale while the server keeps
+    running. The SessionStart hook fires again with the new id, keyed by the same
+    Claude Code process, so the server follows it."""
+    import subprocess
+
+    handoff = tmp_path / "handoff"
+    tmproot = tmp_path / "tmproot"
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    root = tmproot / f"claude-{os.getuid()}" / str(cwd).replace(os.sep, "-")
+
+    os.environ["PY_SCRATCH_HANDOFF_DIR"] = str(handoff)
+    os.environ["CLAUDE_CODE_TMPDIR"] = str(tmproot)
+    os.environ["CLAUDE_CODE_SESSION_ID"] = "session-a"   # stale after the /clear
+    hook_sh = Path(__file__).parent / "hooks" / "scratchpad-handoff.sh"
+
+    def fire(session_id, source):
+        event = json.dumps({
+            "hook_event_name": "SessionStart", "source": source,
+            "session_id": session_id, "cwd": str(cwd),
+        })
+        r = subprocess.run([str(hook_sh)], input=event, capture_output=True,
+                           text=True, env=dict(os.environ))
+        assert r.returncode == 0 and r.stdout == ""
+
+    old_cwd = os.getcwd()
+    os.chdir(cwd)
+    try:
+        pad_a = root / "session-a" / "scratchpad"
+        pad_b = root / "session-b" / "scratchpad"
+        pad_a.mkdir(parents=True)
+        fire("session-a", "startup")
+        if not list(handoff.glob("*.json")):
+            return  # not running under a real claude process; nothing to assert
+        assert server_mod._claude_scratchpad() == pad_a
+
+        pad_b.mkdir(parents=True)
+        os.utime(root / "session-a", None)   # make the dead session look newest
+        fire("session-b", "clear")
+        assert server_mod._claude_scratchpad() == pad_b
+
+        # without the hook, the mtime heuristic would pick the dead session
+        server_mod._read_handoff = lambda: None
+        assert server_mod._claude_scratchpad() == pad_a
+    finally:
+        _restore_server_probes()
+        os.chdir(old_cwd)
+        for var in ("PY_SCRATCH_HANDOFF_DIR", "CLAUDE_CODE_TMPDIR", "CLAUDE_CODE_SESSION_ID"):
+            os.environ.pop(var, None)
+
+
 if __name__ == "__main__":
     import asyncio
     import inspect
