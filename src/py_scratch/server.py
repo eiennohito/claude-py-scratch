@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import time
 import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
@@ -371,8 +373,11 @@ try:
     SESSION_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
 except OSError:
     pass
-STDOUT_FILE = "stdout.log"
-STDERR_FILE = "stderr.log"
+CODE_FILE = "code.py"
+STDOUT_FILE = "stdout"
+STDERR_FILE = "stderr"
+TRACE_FILE = "trace"
+PID_FILE = "pid"
 SERVER_LOG = SESSION_DIR / "server.log"
 SERVER_STDERR_LOG = SESSION_DIR / "server-stderr.log"
 
@@ -460,19 +465,20 @@ _log.info("selected project: %s", _PROJECT)
 _log.info("extra packages: %s", _EXTRA_PACKAGES)
 _log.info("requires-python: %s", _REQUIRES_PYTHON)
 _exec_counter = 0
-_active_procs: set[asyncio.subprocess.Process] = set()
+_runs: dict[int, _Run] = {}
+_supervisors: set[asyncio.Task] = set()
 
 
-def _next_execution_id() -> str:
+def _next_execution_id() -> int:
     global _exec_counter
     _exec_counter += 1
-    return f"{_exec_counter:04d}"
+    return _exec_counter
 
 
-def _exec_dir() -> tuple[str, Path]:
+def _exec_dir() -> tuple[int, Path]:
     eid = _next_execution_id()
     for base in (_artifact_root(), SESSION_DIR):
-        d = base / eid
+        d = base / str(eid)
         try:
             d.mkdir(mode=0o700, parents=True, exist_ok=True)
             return eid, d
@@ -535,9 +541,10 @@ def _validate_deps(deps: list[str]) -> None:
 
 async def _ensure_env(deps: list[str]) -> None:
     """Run a no-op script with --with flags to force uv to download and cache
-    the environment *before* the user's timeout starts. Without this, a first-time
-    large dep download (e.g. pyarrow, 46 MB) eats the script timeout and gets
-    killed, leaving the cache empty — every subsequent attempt fails the same way."""
+    the environment before the real run. Without this, a first-time large dep
+    download (e.g. pyarrow, 46 MB) would run under the hard limit and get killed,
+    leaving the cache empty — every subsequent attempt fails the same way. (The
+    estimate clock itself starts only once the script does, see _supervise.)"""
     new_deps = [d for d in deps if d not in _primed_deps]
     if not new_deps:
         return
@@ -643,10 +650,12 @@ def _signal_from_exit(exit_code: int) -> int | None:
     return None
 
 
-def _describe_exit(exit_code: int | None, timed_out: bool, timeout: int) -> tuple[str, str | None]:
+def _describe_exit(
+    exit_code: int | None, timed_out: bool, hard_limit: float
+) -> tuple[str, str | None]:
     """Classify how the child ended. Returns (status, human explanation)."""
     if timed_out:
-        return "timeout", f"killed after exceeding the {timeout}s timeout"
+        return "timeout", f"killed after exceeding the {hard_limit:g}s hard limit"
     if exit_code is None:
         return "not_started", "the interpreter could not be started"
     if exit_code == 0:
@@ -677,19 +686,132 @@ def _is_crash_signal(exit_code: int | None) -> bool:
     return signum in _FATAL_SIGNALS
 
 
-async def _run_script(
-    intent: str, code: str, deps: list[str], timeout: int,
-) -> dict:
-    execution_id, exec_dir = _exec_dir()
-    script = exec_dir / "script.py"
-    stdout_path = exec_dir / STDOUT_FILE
-    stderr_path = exec_dir / STDERR_FILE
-    _validate_deps(deps)
+# --- runs: one subprocess each, tracked in a registry so a call can return early ---
+
+_HARD_LIMIT_FACTOR = 10
+# How long uv may spend resolving/installing before the script starts. The estimate
+# clock does not run during this time, so it needs its own bound.
+_START_TIMEOUT = 600
+_RETAIN_RUNS = 200
+
+_SAMPLE_SIGNAL = getattr(signal, "SIGUSR1", None)
+
+
+class _UsageError(Exception):
+    """A bad call (unknown run_id, bad action...), reported as isError."""
+
+
+@dataclass
+class _Run:
+    id: int
+    intent: str
+    dir: Path
+    deps: list[str]
+    estimate: float
+    hard_limit: float
+    proc: asyncio.subprocess.Process | None = None
+    pid: int | None = None          # the interpreter, not the `uv run` wrapper
+    main_ident: int | None = None   # its main thread, to pick it out of a dump
+    t_spawn: float = field(default_factory=time.monotonic)
+    t_start: float | None = None    # when the user's script began executing
+    t_end: float | None = None
+    state: str = "running"
+    exit_code: int | None = None
+    explanation: str | None = None
+    kill_reason: str | None = None  # killed | cancelled | timeout | start_timeout
+    last_frame: dict | None = None
+    auto_installed: str | None = None
+    retry_of: int | None = None
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+    @property
+    def pgid(self) -> int | None:
+        # children are session leaders, so the group id is the wrapper's pid
+        return self.proc.pid if self.proc is not None else None
+
+    @property
+    def elapsed(self) -> float:
+        start = self.t_start if self.t_start is not None else self.t_spawn
+        return (self.t_end if self.t_end is not None else time.monotonic()) - start
+
+
+# Runs the user's file through a thin wrapper so the server can ask it where it is:
+# SIGUSR1 makes faulthandler dump every thread's stack into the trace file, which
+# works even while the interpreter is stuck in a C extension. The pid file doubles
+# as the "script has started" marker. The code is exec'd from code.py so tracebacks
+# and the dump both name that file and its real line numbers.
+_BOOTSTRAP = '''\
+import faulthandler, os, signal, sys, threading, traceback
+
+
+def _main():
+    code, trace, pidfile = sys.argv[1:4]
+    fh = open(trace, "ab", buffering=0)
+    sys._pyscratch_trace = fh
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, file=fh, all_threads=True)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    with open(pidfile + ".tmp", "w") as f:
+        f.write(f"{os.getpid()} {threading.get_ident()}")
+    os.replace(pidfile + ".tmp", pidfile)
+    import __main__
+    sys.argv = [code]
+    sys.path[0] = os.path.dirname(code)
+    __main__.__file__ = code
+    with open(code, encoding="utf-8") as f:
+        src = f.read()
+    try:
+        exec(compile(src, code, "exec", dont_inherit=True), __main__.__dict__)
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        traceback.print_exception(type(exc), exc, exc.__traceback__.tb_next)
+        sys.exit(1)
+
+
+_main()
+'''
+
+
+def _read_pidfile(run_dir: Path) -> tuple[int, int, float] | None:
+    """(pid, main thread ident, time the script started) once the wrapper wrote it."""
+    p = run_dir / PID_FILE
+    try:
+        pid, ident = p.read_text().split()
+        return int(pid), int(ident), p.stat().st_mtime
+    except (OSError, ValueError):
+        return None
+
+
+def _prune_runs() -> None:
+    if len(_runs) <= _RETAIN_RUNS:
+        return
+    for rid in [r for r, run in _runs.items() if run.done.is_set()][: len(_runs) - _RETAIN_RUNS]:
+        del _runs[rid]
+
+
+async def _launch(intent: str, code: str, deps: list[str], estimate: float) -> _Run:
+    """Start a run and return at once; _supervise tracks it from here on."""
+    try:
+        _validate_deps(deps)
+    except ValueError as exc:
+        raise _UsageError(str(exc)) from None
+    run_id, run_dir = _exec_dir()
+    run = _Run(run_id, intent, run_dir, deps, estimate, estimate * _HARD_LIMIT_FACTOR)
+    _runs[run_id] = run
+    _prune_runs()
+    code_path = run_dir / CODE_FILE
+    boot_path = run_dir / "bootstrap.py"
     if _PROJECT:
-        _write_script(script, code, [])
+        _write_script(code_path, code, [])
+        _write_script(boot_path, _BOOTSTRAP, [])
         extra_deps = deps
     else:
-        _write_script(script, code, deps)
+        # PEP 723 metadata is read from the file uv runs, i.e. the bootstrap
+        _write_script(code_path, code, deps)
+        _write_script(boot_path, _BOOTSTRAP, deps)
         extra_deps = []
     # Only prime when deps are passed as --with flags (_PROJECT path).
     # In the non-project path, deps are PEP 723 inline metadata in the script
@@ -697,82 +819,242 @@ async def _run_script(
     # warm a different cache key.
     if extra_deps:
         await _ensure_env(extra_deps)
-    cmd = _build_command(str(script), extra_deps=extra_deps)
-    _log.info("exec %s: %s", execution_id, cmd)
-    t0 = time.monotonic()
-    timed_out = False
-    start_error: str | None = None
-    exit_code: int | None = None
+    cmd = _build_command(
+        str(boot_path), str(code_path), str(run_dir / TRACE_FILE), str(run_dir / PID_FILE),
+        extra_deps=extra_deps,
+    )
+    _log.info("run %s: %s", run_id, cmd)
     try:
-        with open(stdout_path, "wb") as out_f, open(stderr_path, "wb") as err_f:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=out_f,
-                stderr=err_f,
-                cwd=os.getcwd(),
-                start_new_session=True,
+        with open(run_dir / STDOUT_FILE, "wb") as out_f, open(run_dir / STDERR_FILE, "wb") as err_f:
+            run.proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=out_f, stderr=err_f, cwd=os.getcwd(), start_new_session=True,
             )
-            _active_procs.add(proc)
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                timed_out = True
-                _kill_process(proc)
-                await proc.wait()
-                err_f.write(f"\n[killed: exceeded {timeout}s timeout]".encode())
-            finally:
-                _active_procs.discard(proc)
-                # returncode is negative when the child was terminated by a signal;
-                # keep it as-is instead of flattening it to -1, so a crash is
-                # distinguishable from our own timeout kill.
-                exit_code = proc.returncode
     except OSError as exc:
         # uv missing from PATH, temp filesystem full, fork failure under memory
         # pressure. Report it as a failed execution rather than letting it escape.
-        start_error = f"{type(exc).__name__}: {exc}"
-        _log.error("exec %s could not start: %s", execution_id, start_error)
+        _log.error("run %s could not start: %s", run_id, exc)
+        run.kill_reason = "start_error"
+        run.explanation = f"{type(exc).__name__}: {exc}"
+        _finalize(run, None)
+        return run
+    task = asyncio.create_task(_supervise(run))
+    _supervisors.add(task)
+    task.add_done_callback(_supervisors.discard)
+    return run
 
-    duration_ms = int((time.monotonic() - t0) * 1000)
-    status, explanation = _describe_exit(exit_code, timed_out, timeout)
-    if start_error is not None:
-        status, explanation = "not_started", start_error
 
-    meta: dict = {
-        "execution_id": execution_id,
-        "intent": intent,
+async def _supervise(run: _Run) -> None:
+    """Own a run until it ends: note when the script actually starts, enforce the
+    hard limit, collect the exit status. Runs independently of any tool call, so
+    a call can return while the script carries on."""
+    exit_code = None
+    try:
+        waiter = asyncio.ensure_future(run.proc.wait())
+        deadline = time.monotonic() + _START_TIMEOUT
+        while not waiter.done():
+            info = _read_pidfile(run.dir)
+            if info is not None:
+                break
+            if time.monotonic() > deadline:
+                run.kill_reason = "start_timeout"
+                _kill_process(run.proc)
+                break
+            await asyncio.wait({waiter}, timeout=0.01)
+        info = _read_pidfile(run.dir)
+        if info is not None:
+            run.pid, run.main_ident, mtime = info
+            # the pid file was written when the script started; convert its wall
+            # clock age to the monotonic clock
+            run.t_start = time.monotonic() - max(0.0, time.time() - mtime)
+        run.started.set()
+        while not waiter.done() and run.kill_reason is None:
+            start = run.t_start if run.t_start is not None else run.t_spawn
+            remaining = start + run.hard_limit - time.monotonic()
+            if remaining <= 0:
+                run.kill_reason = "timeout"
+                await _sample(run)  # leave the last known position behind
+                _kill_process(run.proc)
+                break
+            await asyncio.wait({waiter}, timeout=remaining)
+        exit_code = await waiter
+    except Exception:
+        _log.exception("supervising run %s failed", run.id)
+        _kill_process(run.proc)
+    finally:
+        _finalize(run, exit_code)
+
+
+def _finalize(run: _Run, exit_code: int | None) -> None:
+    run.t_end = time.monotonic()
+    run.exit_code = exit_code
+    if run.kill_reason in ("killed", "cancelled"):
+        run.state = "killed"
+        run.explanation = (
+            "cancelled by the client" if run.kill_reason == "cancelled" else "killed on request"
+        )
+    elif run.kill_reason == "start_timeout":
+        run.state = "not_started"
+        run.explanation = f"the script did not start within {_START_TIMEOUT}s"
+    elif run.kill_reason == "start_error":
+        run.state = "not_started"
+    else:
+        run.state, run.explanation = _describe_exit(
+            exit_code, run.kill_reason == "timeout", run.hard_limit
+        )
+    if run.state in ("crashed", "not_started"):
+        _log.warning("run %s %s: %s", run.id, run.state, run.explanation)
+    meta = {
+        "run_id": run.id,
+        "intent": run.intent,
         "exit_code": exit_code,
-        "status": status,
-        "duration_ms": duration_ms,
-        "dependencies": deps,
+        "status": run.state,
+        "duration_s": round(run.elapsed, 3),
+        "estimate_s": run.estimate,
+        "hard_limit_s": run.hard_limit,
+        "dependencies": run.deps,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    if explanation:
-        meta["explanation"] = explanation
+    if run.explanation:
+        meta["explanation"] = run.explanation
     if _PROJECT:
         meta["project"] = str(_PROJECT)
     if _EXTRA_PACKAGES:
         meta["extra_packages"] = [str(p) for p in _EXTRA_PACKAGES]
     meta["server_log"] = str(SERVER_LOG)
     try:
-        (exec_dir / "meta.json").write_text(
+        (run.dir / "meta.json").write_text(
             json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
         )
     except OSError as exc:
-        _log.warning("could not write meta.json for %s: %s", execution_id, exc)
+        _log.warning("could not write meta.json for run %s: %s", run.id, exc)
+    run.started.set()
+    run.done.set()
 
-    if status in ("crashed", "not_started"):
-        _log.warning("exec %s %s: %s", execution_id, status, explanation)
 
-    result = {
-        "execution_id": execution_id,
-        "exit_code": exit_code,
-        "status": status,
-        "duration_ms": duration_ms,
-        "exec_dir": exec_dir,
-    }
-    if explanation:
-        result["explanation"] = explanation
-    return result
+# --- stack sampling ---
+
+_TRACE_HEAD = re.compile(r"^(?:Current thread|Thread) (0x[0-9a-fA-F]+)")
+_TRACE_FRAME = re.compile(r'^\s+File "(.*)", line (\d+) in (.*)$')
+
+
+def _parse_trace(text: str, main_ident: int | None) -> list[tuple[str, int, str]]:
+    """Frames (innermost first) of the main thread from a faulthandler dump."""
+    threads: list[tuple[int, list[tuple[str, int, str]]]] = []
+    for ln in text.splitlines():
+        m = _TRACE_HEAD.match(ln)
+        if m:
+            threads.append((int(m.group(1), 16), []))
+            continue
+        m = _TRACE_FRAME.match(ln)
+        if m and threads:
+            threads[-1][1].append((m.group(1), int(m.group(2)), m.group(3)))
+    if not threads:
+        return []
+    # fall back to the last-listed thread, which is the oldest, i.e. the main one
+    return next((fr for ident, fr in threads if ident == main_ident), threads[-1][1])
+
+
+def _source_line(path: str, lineno: int) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace").splitlines()[lineno - 1].strip()
+    except (OSError, IndexError):
+        return ""
+
+
+def _pick_frame(frames: list[tuple[str, int, str]], code_path: Path) -> dict | None:
+    """The innermost frame in the user's own file, which is what they can act on;
+    when the script is deeper in a library, say so too."""
+    if not frames:
+        return None
+    own = next((f for f in frames if f[0] == str(code_path)), None)
+    file, line, func = own or frames[0]
+    frame = {"file": file, "line": line, "func": func, "source": _source_line(file, line)}
+    if own is not None and own is not frames[0]:
+        frame["inner"] = f"{Path(frames[0][0]).name}:{frames[0][1]} {frames[0][2]}"
+    return frame
+
+
+async def _sample(run: _Run) -> None:
+    """Dump the interpreter's stacks into the trace file and remember where the
+    main thread is. Best effort: a failed sample leaves the previous one in place."""
+    if _SAMPLE_SIGNAL is None or run.pid is None or run.done.is_set():
+        return
+    trace = run.dir / TRACE_FILE
+    try:
+        os.truncate(trace, 0)
+        os.kill(run.pid, _SAMPLE_SIGNAL)
+    except OSError:
+        return
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        try:
+            if trace.stat().st_size > 0:
+                break
+        except OSError:
+            return
+    await asyncio.sleep(0.03)  # let a multi-thread dump finish
+    frame = _pick_frame(
+        _parse_trace(_read_log(trace), run.main_ident), run.dir / CODE_FILE
+    )
+    if frame is not None:
+        run.last_frame = frame
+
+
+# --- waiting, killing, reporting ---
+
+# the msg id of the tool call being handled, so a cancellation can find its run
+_current_msg: contextvars.ContextVar = contextvars.ContextVar("py_scratch_msg", default=None)
+_blocking: dict = {}
+
+
+async def _settle(run: _Run, period: float, from_start: bool) -> None:
+    """Block until the run ends or `period` seconds pass (counted from the script's
+    start for the first call, from now for a wait); if it is still going, sample it."""
+    msg_id = _current_msg.get()
+    if msg_id is not None:
+        _blocking[msg_id] = run
+    try:
+        await run.started.wait()
+        if not run.done.is_set():
+            if from_start:
+                period = max(0.0, period - run.elapsed)
+            try:
+                await asyncio.wait_for(run.done.wait(), period)
+            except asyncio.TimeoutError:
+                pass
+        if not run.done.is_set():
+            await _sample(run)
+    finally:
+        if msg_id is not None:
+            _blocking.pop(msg_id, None)
+
+
+async def _kill_run(run: _Run, reason: str) -> None:
+    if run.proc is not None and run.proc.returncode is None and not run.done.is_set():
+        run.kill_reason = reason
+        _kill_process(run.proc)
+    try:
+        await asyncio.wait_for(run.done.wait(), 10)
+    except asyncio.TimeoutError:
+        pass
+
+
+def _kill_all_runs() -> None:
+    for run in _runs.values():
+        if not run.done.is_set() and run.proc is not None:
+            run.kill_reason = run.kill_reason or "killed"
+            _kill_process(run.proc)
+
+
+def _cancel_request(request_id) -> None:
+    """notifications/cancelled: the client gave up on a call that is blocking on a
+    run, so nobody is left to read its result; stop the run too."""
+    run = _blocking.get(request_id)
+    if run is not None and not run.done.is_set():
+        _log.info("request %s cancelled, killing run %s", request_id, run.id)
+        run.kill_reason = "cancelled"
+        if run.proc is not None:
+            _kill_process(run.proc)
 
 
 def _kill_process(proc) -> None:
@@ -794,14 +1076,91 @@ def _kill_process(proc) -> None:
         pass
 
 
-def _has_output(exec_dir: Path) -> bool:
+def _has_output(run_dir: Path) -> bool:
     for name in (STDOUT_FILE, STDERR_FILE):
         try:
-            if (exec_dir / name).stat().st_size > 0:
+            if (run_dir / name).stat().st_size > 0:
                 return True
         except OSError:
             continue
     return False
+
+
+def _fmt_secs(x: float) -> str:
+    return f"{x:.2f}s" if x < 10 else f"{x:.1f}s"
+
+
+def _status_line(run: _Run) -> str:
+    names = [CODE_FILE, STDOUT_FILE, STDERR_FILE]
+    try:
+        if (run.dir / TRACE_FILE).stat().st_size > 0:
+            names.append(TRACE_FILE)
+    except OSError:
+        pass
+    where = f"run {run.id} · {run.dir}/{{{','.join(names)}}}"
+    el = _fmt_secs(run.elapsed)
+    if run.state == "running":
+        head = f"running {el} (estimate {run.estimate:g}s, hard limit {run.hard_limit:g}s)"
+    elif run.state in ("ok", "failed", "crashed"):
+        head = f"{run.state} exit={run.exit_code} {el}"
+    elif run.state == "timeout":
+        head = f"timeout (hard limit {run.hard_limit:g}s) {el}"
+    elif run.state == "killed":
+        head = f"killed {el}"
+    else:
+        head = run.state
+    line = f"{head} · {where}"
+    if run.auto_installed:
+        line += f" · auto-installed {run.auto_installed}"
+    if run.retry_of is not None:
+        line += f" · retry of run {run.retry_of}"
+    return line
+
+
+def _render(run: _Run, head: int, tail: int, notes: list[str] | None = None) -> str:
+    """The whole tool result: status line first, then only what is relevant."""
+    out = [_status_line(run)]
+    if run.state in ("crashed", "not_started") and run.explanation:
+        out.append(run.explanation)
+    frame = run.last_frame
+    if frame:
+        label = "at line" if run.state == "running" else "last seen at line"
+        text = f"{label} {frame['line']}: {frame['source']}"
+        if frame.get("inner"):
+            text += f"  [in {frame['inner']}]"
+        out.append(text)
+    stdout = _preview(run.dir / STDOUT_FILE, head, tail)
+    if stdout:
+        out.append(stdout)
+    if run.state == "running":
+        out.append(f'→ run_python_script(run_id={run.id}, action="wait"|"kill")')
+    stderr_path = run.dir / STDERR_FILE
+    if run.state in ("ok", "running"):
+        n = len(_read_log(stderr_path).splitlines())
+        if n:
+            out.append(f"(stderr: {n} lines, see file)")
+    else:
+        stderr = _preview(stderr_path, head, tail)
+        if stderr:
+            out.append("stderr:\n" + stderr)
+    if notes:
+        out.append("note: " + "; ".join(notes))
+    return "\n".join(out)
+
+
+def _run_status(run: _Run) -> dict:
+    return {
+        "id": run.id,
+        "state": run.state,
+        "elapsed": round(run.elapsed, 3),
+        "estimate": run.estimate,
+        "hard_limit": run.hard_limit,
+        "exit_code": run.exit_code,
+        "pgid": run.pgid,
+        "last_frame": run.last_frame,
+        "dir": str(run.dir),
+        "intent": run.intent,
+    }
 
 
 def _as_int(value, default: int, low: int, high: int) -> int:
@@ -813,7 +1172,17 @@ def _as_int(value, default: int, low: int, high: int) -> int:
     return max(low, min(high, n))
 
 
-def _normalise_args(intent, code, deps, timeout, head, tail):
+def _as_float(value, default, low: float, high: float):
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return default
+    if n != n:  # NaN
+        return default
+    return max(low, min(high, n))
+
+
+def _normalise_args(intent, code, deps, time_estimate, head, tail):
     """Accept the loose shapes models actually send: numbers as strings, a bare
     string where a list is expected, None for optionals."""
     if isinstance(deps, str):
@@ -823,62 +1192,98 @@ def _normalise_args(intent, code, deps, timeout, head, tail):
         str(intent) if intent is not None else "",
         code if isinstance(code, str) else str(code),
         deps,
-        _as_int(timeout, 30, 1, 86400),
+        _as_float(time_estimate, 10.0, 0.1, 86400.0),
         _as_int(head, 0, 0, 100000),
         _as_int(tail, 5, 0, 100000),
     )
 
 
+def _lookup_run(run_id) -> _Run:
+    try:
+        run = _runs.get(int(run_id))
+    except (TypeError, ValueError):
+        run = None
+    if run is None:
+        known = ", ".join(str(r) for r in list(_runs)[-10:]) or "none"
+        raise _UsageError(f"Unknown run_id {run_id!r}. Known runs: {known}.")
+    return run
+
+
 async def run_python_script(
-    intent: str,
-    code: str,
+    intent: str = "",
+    code: str | None = None,
     dependencies: list[str] | None = None,
-    timeout: int = 30,
+    time_estimate: float | None = None,
     head: int = 0,
     tail: int = 5,
-) -> dict:
+    run_id: int | None = None,
+    action: str | None = None,
+    argument_notes: list[str] | None = None,
+) -> str:
+    notes = argument_notes or []
+    if run_id is not None:
+        return await _follow_up(run_id, action, time_estimate, head, tail, notes)
+    if action is not None:
+        raise _UsageError("'action' needs a 'run_id'.")
     deps = list(dependencies or [])
-    intent, code, deps, timeout, head, tail = _normalise_args(
-        intent, code, deps, timeout, head, tail
+    intent, code, deps, estimate, head, tail = _normalise_args(
+        intent, code, deps, time_estimate, head, tail
     )
-    result = await _run_script(intent, code, deps, timeout)
-    exec_dir = result.pop("exec_dir")
+    run = await _launch(intent, code, deps, estimate)
+    await _settle(run, estimate, from_start=True)
+
+    # The retries below only make sense for a run that finished within its
+    # estimate; one that is still running is handed back to the caller as-is.
 
     # auto-retry on ImportError if no deps were declared
-    if result["exit_code"] != 0 and not deps:
-        inferred = _infer_dep(exec_dir / STDERR_FILE)
+    if run.state == "failed" and not deps:
+        inferred = _infer_dep(run.dir / STDERR_FILE)
         if inferred:
             deps = [inferred]
-            result = await _run_script(intent, code, deps, timeout)
-            exec_dir = result.pop("exec_dir")
-            result["auto_installed"] = inferred
+            run = await _launch(intent, code, deps, estimate)
+            run.auto_installed = inferred
+            await _settle(run, estimate, from_start=True)
 
     # A child that died on a fatal signal without producing a single byte never got
     # far enough to have side effects, and the cause (OOM sweep, a flaky native
     # import, a bad page) is often transient. Retry exactly once.
     if (
-        result["status"] == "crashed"
-        and _is_crash_signal(result["exit_code"])
-        and not _has_output(exec_dir)
+        run.state == "crashed"
+        and _is_crash_signal(run.exit_code)
+        and not _has_output(run.dir)
     ):
-        _log.warning("exec %s crashed with no output, retrying once", result["execution_id"])
-        retry = await _run_script(intent, code, deps, timeout)
-        retry_dir = retry.pop("exec_dir")
-        retry["crash_retry_of"] = result["execution_id"]
-        if retry["status"] == "crashed":
-            retry["explanation"] = (
-                f"{retry.get('explanation', 'crashed')}; "
-                "reproduced on retry, so this is not a transient failure"
+        _log.warning("run %s crashed with no output, retrying once", run.id)
+        first = run
+        run = await _launch(intent, code, deps, estimate)
+        run.retry_of = first.id
+        run.auto_installed = first.auto_installed
+        await _settle(run, estimate, from_start=True)
+        if run.state == "crashed":
+            run.explanation = (
+                f"{run.explanation}; reproduced on retry, so this is not a transient failure"
             )
-        result, exec_dir = retry, retry_dir
 
-    return {
-        **result,
-        "stdout_preview": _preview(exec_dir / STDOUT_FILE, head, tail),
-        "stderr_preview": _preview(exec_dir / STDERR_FILE, head, tail),
-        "stdout_path": str(exec_dir / STDOUT_FILE),
-        "stderr_path": str(exec_dir / STDERR_FILE),
-    }
+    return _render(run, head, tail, notes)
+
+
+async def _follow_up(run_id, action, time_estimate, head, tail, notes) -> str:
+    run = _lookup_run(run_id)
+    head = _as_int(head, 0, 0, 100000)
+    tail = _as_int(tail, 5, 0, 100000)
+    action = action or "wait"
+    if action == "kill":
+        await _kill_run(run, "killed")
+    elif action == "wait":
+        period = _as_float(time_estimate, None, 0.1, 86400.0)
+        if period is not None and not run.done.is_set():
+            # a fresh estimate renews the grace period as well, so a script that
+            # turns out to need minutes is not shot at the original limit
+            run.estimate = period
+            run.hard_limit = max(run.hard_limit, run.elapsed + period * _HARD_LIMIT_FACTOR)
+        await _settle(run, period if period is not None else run.estimate, from_start=False)
+    else:
+        raise _UsageError(f"Unknown action {action!r}: use \"wait\" or \"kill\".")
+    return _render(run, head, tail, notes)
 
 
 # --- MCP protocol (JSON-RPC over stdio) ---
@@ -887,7 +1292,17 @@ _BASE_DESCRIPTION = (
     "Execute a Python script with optional dependencies. "
     "Use this for any Python longer than a couple lines or requiring third-party packages. "
     "Code is passed as a raw string — no shell escaping needed. "
-    "Dependencies are installed automatically via uv."
+    "Dependencies are installed automatically via uv.\n\n"
+    "Always set time_estimate to your honest estimate of how many seconds the script should "
+    "take. If it is still running when that time is up, the call returns immediately with "
+    "state \"running\", the line it is currently executing and a run_id, while the script "
+    "keeps running in the background (hard-killed at 10x the estimate). Then call again with "
+    "run_id and action=\"wait\" or \"kill\". A script you expected to take a second that "
+    "is still running after ten is almost always an infinite loop or accidentally quadratic "
+    "code: kill it and fix it rather than waiting.\n\n"
+    "The result is plain text: a status line (state, exit code, time, run id, the run "
+    "directory holding code.py, stdout, stderr, and trace), then a stdout preview. "
+    "Read the files in the run directory with the Read tool for the full output."
 )
 
 _TOOL_INPUT_SCHEMA = {
@@ -897,17 +1312,29 @@ _TOOL_INPUT_SCHEMA = {
             "type": "string",
             "description": "What are you trying to do with this script?",
         },
-        "code": {"type": "string", "description": "Raw Python source code"},
+        "code": {
+            "type": "string",
+            "description": "Raw Python source code. Required unless run_id is given.",
+        },
         "dependencies": {
             "type": "array",
             "items": {"type": "string"},
             "description": "Optional PyPI package names",
             "default": [],
         },
-        "timeout": {
-            "type": "integer",
-            "description": "Seconds before the script is killed",
-            "default": 30,
+        "time_estimate": {
+            "type": "number",
+            "description": (
+                "IMPORTANT: your best estimate, in seconds, of how long this script should "
+                "take (default 10). Think about the data size and the work involved. If the "
+                "script is still running after this many seconds the call returns with "
+                "state \"running\" and the current line, and the script continues in the "
+                "background; it is killed at 10x the estimate. Do not pad the estimate "
+                "\"to be safe\": an honest short estimate surfaces infinite loops and "
+                "quadratic code within seconds instead of minutes. With action=\"wait\", "
+                "the time to wait this round (default: the original estimate)."
+            ),
+            "default": 10,
         },
         "head": {
             "type": "integer",
@@ -919,8 +1346,22 @@ _TOOL_INPUT_SCHEMA = {
             "description": "Number of lines to show from the end of stdout/stderr preview",
             "default": 5,
         },
+        "run_id": {
+            "type": "integer",
+            "description": (
+                "Follow up on an earlier run that returned state \"running\"; "
+                "code and intent are then not needed."
+            ),
+        },
+        "action": {
+            "type": "string",
+            "enum": ["wait", "kill"],
+            "description": (
+                "With run_id. \"wait\" (default): block until the run finishes or another "
+                "time_estimate passes, then report again. \"kill\": stop the run."
+            ),
+        },
     },
-    "required": ["intent", "code"],
 }
 
 
@@ -975,8 +1416,8 @@ def _sync_handle(method: str, params: dict | None) -> dict | None:
     if method == "initialize":
         return {
             "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "py-scratch", "version": "0.7.0"},
+            "capabilities": {"tools": {}, "resources": {}},
+            "serverInfo": {"name": "py-scratch", "version": "0.8.1"},
         }
     if method == "notifications/initialized":
         return None
@@ -984,7 +1425,59 @@ def _sync_handle(method: str, params: dict | None) -> dict | None:
         return {"tools": [TOOL_DEF]}
     if method == "ping":
         return {}
+    if method == "resources/list":
+        return {"resources": _list_resources()}
+    if method == "resources/templates/list":
+        return {"resourceTemplates": [{
+            "uriTemplate": "pyscratch://runs/{id}/status",
+            "name": "run-status",
+            "description": "State of a run_python_script run (JSON)",
+            "mimeType": "application/json",
+        }]}
+    if method == "resources/read":
+        return _read_resource((params or {}).get("uri"))
     return None
+
+
+class _RpcError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+_STATUS_URI = re.compile(r"^pyscratch://runs/(\d+)/status$")
+_LISTED_FINISHED = 20
+
+
+def _list_resources() -> list[dict]:
+    """Active runs plus the most recent finished ones."""
+    runs = sorted(_runs.values(), key=lambda r: r.id, reverse=True)
+    finished = 0
+    out = []
+    for run in runs:
+        if run.done.is_set():
+            finished += 1
+            if finished > _LISTED_FINISHED:
+                continue
+        out.append({
+            "uri": f"pyscratch://runs/{run.id}/status",
+            "name": f"run {run.id}",
+            "description": f"{run.state}: {run.intent}",
+            "mimeType": "application/json",
+        })
+    return out
+
+
+def _read_resource(uri) -> dict:
+    m = _STATUS_URI.match(uri) if isinstance(uri, str) else None
+    run = _runs.get(int(m.group(1))) if m else None
+    if run is None:
+        raise _RpcError(-32002, f"Resource not found: {uri}")
+    return {"contents": [{
+        "uri": uri,
+        "mimeType": "application/json",
+        "text": json.dumps(_run_status(run), ensure_ascii=False),
+    }]}
 
 
 async def _write_message(message: dict) -> None:
@@ -1010,7 +1503,9 @@ def _error_result(text: str) -> dict:
 # Argument names models reach for that are not the ones in the schema. Silently
 # failing on these used to strand the request forever, so map the obvious ones and
 # tell the caller what we did.
-_TOOL_PARAMS = {"intent", "code", "dependencies", "timeout", "head", "tail"}
+_TOOL_PARAMS = {
+    "intent", "code", "dependencies", "time_estimate", "head", "tail", "run_id", "action",
+}
 _ARG_ALIASES = {
     "script": "code",
     "source": "code",
@@ -1020,12 +1515,15 @@ _ARG_ALIASES = {
     "packages": "dependencies",
     "requirements": "dependencies",
     "description": "intent",
+    "timeout": "time_estimate",
 }
 
 _ARG_HELP = (
     "run_python_script takes: 'intent' (str, what you are trying to do) and "
     "'code' (str, raw Python source); optional 'dependencies' (list[str]), "
-    "'timeout' (int seconds), 'head' (int), 'tail' (int)."
+    "'time_estimate' (number, seconds you expect it to take), 'head' (int), 'tail' (int). "
+    "To follow up on a run that is still running: 'run_id' (int) and "
+    "'action' (\"wait\" or \"kill\")."
 )
 
 
@@ -1041,7 +1539,12 @@ def _coerce_args(args: dict) -> tuple[dict, list[str]]:
         if target in clean:
             notes.append(f"ignored {key!r}: {target!r} already provided")
             continue
-        if target != key:
+        if key == "timeout" and target == "time_estimate":
+            notes.append(
+                "'timeout' is now 'time_estimate': your estimate of the run time in "
+                "seconds, not a limit (the hard kill is at 10x)"
+            )
+        elif target != key:
             notes.append(f"interpreted {key!r} as {target!r}")
         clean[target] = value
     if "code" in clean and not clean.get("intent"):
@@ -1057,6 +1560,7 @@ async def _handle_tool_call(msg_id: int | str, params: dict | None) -> None:
     no per-request timeout of its own beyond a 30-minute idle abort, so a dropped
     response looks to the model like a tool that silently never returned.
     """
+    token = _current_msg.set(msg_id)
     try:
         params = params or {}
         name = params.get("name")
@@ -1069,26 +1573,26 @@ async def _handle_tool_call(msg_id: int | str, params: dict | None) -> None:
             result = _error_result(f"'arguments' must be an object, got {type(args).__name__}")
         else:
             clean, notes = _coerce_args(args)
-            if not isinstance(clean.get("code"), str) or not clean["code"].strip():
+            if clean.get("run_id") is None and (
+                not isinstance(clean.get("code"), str) or not clean["code"].strip()
+            ):
                 result = _error_result(
-                    "Missing required argument 'code'. "
+                    "Missing required argument 'code' (or 'run_id' to follow up on a run). "
                     f"Received arguments: {sorted(args)}. {_ARG_HELP}"
                 )
             else:
-                data = await run_python_script(**clean)
-                if notes:
-                    data["argument_notes"] = notes
-                result = {
-                    "content": [
-                        {"type": "text", "text": json.dumps(data, indent=2, ensure_ascii=False)}
-                    ]
-                }
+                text = await run_python_script(**clean, argument_notes=notes)
+                result = {"content": [{"type": "text", "text": text}]}
+    except _UsageError as exc:
+        result = _error_result(str(exc))
     except Exception as exc:
         _log.exception("tool call %s failed", msg_id)
         result = _error_result(
             f"py-scratch failed to run this call: {type(exc).__name__}: {exc}\n"
             f"Server log: {SERVER_LOG}\n{traceback.format_exc()}"
         )
+    finally:
+        _current_msg.reset(token)
 
     try:
         await _write_response(msg_id, result)
@@ -1120,6 +1624,11 @@ async def serve() -> None:
     loop = asyncio.get_event_loop()
     reader = asyncio.StreamReader(limit=_READ_LIMIT)
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+    try:
+        # a terminated server must not leave background runs behind: treat it as EOF
+        loop.add_signal_handler(signal.SIGTERM, reader.feed_eof)
+    except (NotImplementedError, RuntimeError, ValueError):
+        pass
 
     pending: set[asyncio.Task] = set()
     while True:
@@ -1154,8 +1663,16 @@ async def serve() -> None:
             task.add_done_callback(_log_task_result)
             continue
 
+        if method == "notifications/cancelled":
+            _cancel_request((params or {}).get("requestId"))
+            continue
+
         try:
             result = _sync_handle(method, params)
+        except _RpcError as exc:
+            if "id" in msg:
+                await _write_rpc_error(msg["id"], exc.code, str(exc))
+            continue
         except Exception as exc:
             _log.exception("handler for %s failed", method)
             if "id" in msg:
@@ -1169,9 +1686,11 @@ async def serve() -> None:
         else:
             await _write_response(msg["id"], result)
 
-    for proc in _active_procs:
-        _kill_process(proc)
+    # Runs outlive the calls that started them, so nothing else would stop them now.
+    _kill_all_runs()
     for task in pending:
         task.cancel()
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
+    if _supervisors:
+        await asyncio.wait(set(_supervisors), timeout=5)

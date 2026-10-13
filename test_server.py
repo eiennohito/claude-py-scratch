@@ -7,7 +7,10 @@
 import asyncio
 import json
 import os
+import re
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -65,47 +68,347 @@ def test_infer_dep_missing_file(tmp_path):
     assert _infer_dep(tmp_path / "nope.log") is None
 
 
-# --- execution (via public API) ---
+# --- run_python_script (public API; returns the plain-text result) ---
+
+def _run_of(text):
+    """The registry entry for the run a result text is about."""
+    return server_mod._runs[int(re.search(r"run (\d+)", text.splitlines()[0]).group(1))]
 
 
-# --- run_python_script (public API) ---
+def _body(text):
+    return text.splitlines()[1:]
 
-async def test_run_python_script_returns_paths():
+
+async def test_fast_script_gives_ok_line():
     r = await run_python_script(intent="test", code="print('hi')")
-    assert r["exit_code"] == 0
-    assert r["stdout_path"].endswith("stdout.log")
-    assert r["stderr_path"].endswith("stderr.log")
-    assert Path(r["stdout_path"]).exists()
-    assert "hi" in r["stdout_preview"]
+    first = r.splitlines()[0]
+    assert re.match(r"ok exit=0 \d+\.\d\ds · run \d+ · .*/\{code\.py,stdout,stderr\}$", first)
+    assert _body(r) == ["hi"]
+    run = _run_of(r)
+    assert (run.dir / "stdout").read_text() == "hi\n"
+    assert (run.dir / "code.py").exists()
+    assert not r.lstrip().startswith("{")  # plain text, not JSON
 
 
 async def test_run_python_script_default_tail_5():
     code = "\n".join(f"print('line {i}')" for i in range(20))
-    r = await run_python_script(intent="test", code=code)
-    preview_lines = r["stdout_preview"].strip().split("\n")
-    assert len(preview_lines) == 5
-    assert "line 15" in preview_lines[0]
-    assert "line 19" in preview_lines[-1]
+    lines = _body(await run_python_script(intent="test", code=code))
+    assert len(lines) == 5
+    assert "line 15" in lines[0]
+    assert "line 19" in lines[-1]
 
 
 async def test_run_python_script_head_only():
     code = "\n".join(f"print('line {i}')" for i in range(20))
-    r = await run_python_script(intent="test", code=code, head=3, tail=0)
-    preview_lines = r["stdout_preview"].strip().split("\n")
-    assert len(preview_lines) == 3
-    assert "line 0" in preview_lines[0]
-    assert "line 2" in preview_lines[-1]
+    lines = _body(await run_python_script(intent="test", code=code, head=3, tail=0))
+    assert len(lines) == 3
+    assert "line 0" in lines[0]
+    assert "line 2" in lines[-1]
 
 
 async def test_run_python_script_head_and_tail():
     code = "\n".join(f"print('line {i}')" for i in range(20))
-    r = await run_python_script(intent="test", code=code, head=2, tail=2)
-    preview_lines = r["stdout_preview"].strip().split("\n")
-    assert len(preview_lines) == 4
-    assert "line 0" in preview_lines[0]
-    assert "line 1" in preview_lines[1]
-    assert "line 18" in preview_lines[2]
-    assert "line 19" in preview_lines[3]
+    lines = _body(await run_python_script(intent="test", code=code, head=2, tail=2))
+    assert len(lines) == 4
+    assert "line 0" in lines[0]
+    assert "line 1" in lines[1]
+    assert "line 18" in lines[2]
+    assert "line 19" in lines[3]
+
+
+async def test_failed_script_shows_stderr_and_exit():
+    r = await run_python_script(intent="t", code="print('out')\nraise ValueError('boom')")
+    assert r.startswith("failed exit=1 ")
+    assert "stderr:" in r and "ValueError: boom" in r
+    # the bootstrap frame is stripped from the traceback
+    assert "bootstrap.py" not in r
+    assert 'code.py", line 2' in r
+
+
+async def test_ok_with_stderr_only_mentions_it():
+    r = await run_python_script(intent="t", code="import sys; print('x', file=sys.stderr)")
+    assert r.startswith("ok ")
+    assert "(stderr: 1 lines" in r
+    assert "stderr:\n" not in r
+
+
+# --- early return, wait, kill, hard limit ---
+
+_SLOW = (
+    "import time\n"
+    "print('started', flush=True)\n"
+    "t0 = time.time()\n"
+    "while time.time() - t0 < 60:\n"
+    "    x = sum(range(1000))\n"        # line 5
+)
+
+
+async def test_exceeding_estimate_returns_running_with_trace():
+    t0 = time.monotonic()
+    r = await run_python_script(intent="slow", code=_SLOW, time_estimate=0.5)
+    try:
+        assert time.monotonic() - t0 < 10
+        first = r.splitlines()[0]
+        assert first.startswith("running ")
+        assert "(estimate 0.5s, hard limit 5s)" in first
+        assert first.endswith("{code.py,stdout,stderr,trace}")
+        run = _run_of(r)
+        assert "at line 5: x = sum(range(1000))" in r
+        assert "started" in r
+        assert f'run_id={run.id}, action="wait"|"kill"' in r
+        trace = (run.dir / "trace").read_text()
+        assert 'code.py", line 5' in trace
+        assert run.state == "running" and run.pid
+    finally:
+        server_mod._kill_process(run.proc)
+        await run.done.wait()
+
+
+async def test_estimate_clock_starts_with_the_script_not_with_uv():
+    # Uncached dependency resolution happens before the script starts; simulate a
+    # slow uv by delaying the interpreter's start. The run must not have counted it.
+    code = "import time; time.sleep(0.2); print('done')"
+    orig = server_mod._build_command
+
+    def slow_start(*argv, extra_deps=None):
+        return ["sh", "-c", 'sleep 1.5; exec "$@"', "sh", *orig(*argv, extra_deps=extra_deps)]
+
+    server_mod._build_command = slow_start
+    try:
+        r = await run_python_script(intent="t", code=code, time_estimate=1)
+    finally:
+        server_mod._build_command = orig
+    assert r.startswith("ok "), r
+    assert _run_of(r).elapsed < 1
+
+
+async def test_wait_completes():
+    r = await run_python_script(
+        intent="t", code="import time; time.sleep(1.2); print('finished')", time_estimate=0.5
+    )
+    assert r.startswith("running ")
+    run = _run_of(r)
+    r2 = await run_python_script(run_id=run.id, action="wait")
+    r3 = r2 if r2.startswith("ok ") else await run_python_script(run_id=run.id, action="wait")
+    assert r3.startswith("ok exit=0 ")
+    assert "finished" in r3
+    # waiting on a finished run just reports it again
+    assert (await run_python_script(run_id=run.id)).startswith("ok ")
+
+
+async def test_wait_still_running_samples_again():
+    r = await run_python_script(intent="t", code=_SLOW, time_estimate=0.3)
+    run = _run_of(r)
+    try:
+        (run.dir / "trace").write_text("")
+        r2 = await run_python_script(run_id=run.id, action="wait")
+        assert r2.startswith("running ")
+        assert "at line 5" in r2
+        assert 'code.py", line 5' in (run.dir / "trace").read_text()
+    finally:
+        server_mod._kill_process(run.proc)
+        await run.done.wait()
+
+
+async def test_wait_with_new_estimate_extends_the_hard_limit():
+    r = await run_python_script(intent="t", code=_SLOW, time_estimate=0.3)
+    run = _run_of(r)
+    try:
+        r2 = await run_python_script(run_id=run.id, action="wait", time_estimate=0.3 * 7)
+        assert "estimate 2.1s" in r2
+        assert run.hard_limit > 3
+    finally:
+        server_mod._kill_process(run.proc)
+        await run.done.wait()
+
+
+async def test_kill_action():
+    r = await run_python_script(intent="t", code=_SLOW, time_estimate=0.3)
+    run = _run_of(r)
+    pid = run.pid
+    k = await run_python_script(run_id=run.id, action="kill")
+    assert k.startswith("killed ")
+    assert run.state == "killed"
+    await asyncio.sleep(0.2)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    raise AssertionError("interpreter survived the kill")
+
+
+async def test_hard_limit_kills_and_keeps_last_trace():
+    r = await run_python_script(intent="t", code=_SLOW, time_estimate=0.1)
+    run = _run_of(r)
+    await asyncio.wait_for(run.done.wait(), 10)
+    assert run.state == "timeout"
+    assert run.elapsed < 3
+    final = await run_python_script(run_id=run.id)
+    assert final.startswith("timeout (hard limit 1s) ")
+    assert "last seen at line 5" in final
+    assert 'code.py", line 5' in (run.dir / "trace").read_text()
+
+
+async def test_hard_limit_kills_the_grandchild_interpreter():
+    # The direct child is `uv run`; the interpreter running the script is its child.
+    # Killing only uv would leave that interpreter alive forever.
+    r = await run_python_script(
+        intent="orphan check",
+        code="import os, sys, time; print(os.getpid(), flush=True); time.sleep(120)",
+        time_estimate=0.2,
+    )
+    run = _run_of(r)
+    await asyncio.wait_for(run.done.wait(), 10)
+    assert run.state == "timeout"
+    child_pid = int((run.dir / "stdout").read_text().split()[0])
+    await asyncio.sleep(0.5)
+    try:
+        os.kill(child_pid, 0)
+    except ProcessLookupError:
+        return
+    raise AssertionError(f"interpreter {child_pid} survived the timeout kill")
+
+
+async def test_unknown_run_id_is_an_error():
+    sent = _collect_responses()
+    await server_mod._handle_tool_call(10, {
+        "name": "run_python_script", "arguments": {"run_id": 987654, "action": "wait"},
+    })
+    assert len(sent) == 1
+    assert sent[0]["result"]["isError"] is True
+    assert "Unknown run_id 987654" in sent[0]["result"]["content"][0]["text"]
+
+
+async def test_bad_action_is_an_error():
+    sent = _collect_responses()
+    r = await run_python_script(intent="t", code="print(1)")
+    await server_mod._handle_tool_call(11, {
+        "name": "run_python_script",
+        "arguments": {"run_id": _run_of(r).id, "action": "explode"},
+    })
+    assert sent[0]["result"]["isError"] is True
+    await server_mod._handle_tool_call(12, {
+        "name": "run_python_script", "arguments": {"action": "kill", "code": "1"},
+    })
+    assert sent[1]["result"]["isError"] is True
+
+
+async def test_timeout_is_an_alias_of_time_estimate():
+    sent = _collect_responses()
+    await server_mod._handle_tool_call(13, {
+        "name": "run_python_script",
+        "arguments": {"code": "import time; time.sleep(30)", "timeout": 0.3},
+    })
+    text = sent[0]["result"]["content"][0]["text"]
+    assert not sent[0]["result"].get("isError")
+    assert text.startswith("running ")
+    assert "estimate 0.3s" in text
+    assert "note: 'timeout' is now 'time_estimate'" in text
+    run = _run_of(text)
+    server_mod._kill_process(run.proc)
+    await run.done.wait()
+
+
+async def test_cancelled_request_kills_its_blocking_run():
+    sent = _collect_responses()
+    task = asyncio.create_task(server_mod._handle_tool_call(14, {
+        "name": "run_python_script",
+        "arguments": {"code": "import time; time.sleep(30)", "time_estimate": 20},
+    }))
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        if 14 in server_mod._blocking and server_mod._blocking[14].pid:
+            break
+    server_mod._cancel_request(14)
+    await asyncio.wait_for(task, 10)
+    assert len(sent) == 1  # still exactly one response
+    assert sent[0]["result"]["content"][0]["text"].startswith("killed ")
+
+
+# --- resources ---
+
+async def test_resource_read_status():
+    r = await run_python_script(intent="watch me", code=_SLOW, time_estimate=0.3)
+    run = _run_of(r)
+    try:
+        uri = f"pyscratch://runs/{run.id}/status"
+        listed = server_mod._sync_handle("resources/list", {})["resources"]
+        assert uri in [x["uri"] for x in listed]
+        got = server_mod._sync_handle("resources/read", {"uri": uri})["contents"][0]
+        assert got["uri"] == uri and got["mimeType"] == "application/json"
+        st = json.loads(got["text"])
+        assert st["state"] == "running"
+        assert st["estimate"] == 0.3 and st["hard_limit"] == 3
+        assert st["exit_code"] is None
+        assert st["pgid"] == run.proc.pid
+        assert st["last_frame"]["line"] == 5
+        assert st["dir"] == str(run.dir)
+        assert st["elapsed"] > 0
+    finally:
+        server_mod._kill_process(run.proc)
+        await run.done.wait()
+    done = json.loads(server_mod._sync_handle("resources/read", {"uri": uri})["contents"][0]["text"])
+    assert done["state"] in ("killed", "crashed")
+
+
+def test_resource_read_unknown_is_an_rpc_error():
+    try:
+        server_mod._sync_handle("resources/read", {"uri": "pyscratch://runs/987654/status"})
+    except server_mod._RpcError as exc:
+        assert exc.code == -32002
+    else:
+        raise AssertionError("expected _RpcError")
+
+
+def test_resource_templates():
+    r = server_mod._sync_handle("resources/templates/list", {})
+    assert r["resourceTemplates"][0]["uriTemplate"] == "pyscratch://runs/{id}/status"
+
+
+# --- end to end over stdio ---
+
+def _spawn_server(tmp_path):
+    env = dict(os.environ, PY_SCRATCH_DIR=str(tmp_path / "art"), PY_SCRATCH_USE_SCRATCHPAD="0",
+               PYTHONPATH=str(Path(__file__).parent / "src"))
+    return subprocess.Popen(
+        [sys.executable, "-m", "py_scratch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, env=env, cwd=str(tmp_path),
+    )
+
+
+def _rpc(proc, msg_id, method, params=None):
+    proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "method": method,
+                                 "params": params or {}}) + "\n")
+    proc.stdin.flush()
+    return json.loads(proc.stdout.readline())
+
+
+def test_eof_kills_live_runs(tmp_path):
+    proc = _spawn_server(tmp_path)
+    try:
+        init = _rpc(proc, 1, "initialize")
+        assert init["result"]["capabilities"]["resources"] == {}
+        assert init["result"]["serverInfo"]["version"] == "0.8.1"
+        resp = _rpc(proc, 2, "tools/call", {"name": "run_python_script", "arguments": {
+            "code": "import os, time; print(os.getpid(), flush=True); time.sleep(120)",
+            "time_estimate": 0.5,
+        }})
+        text = resp["result"]["content"][0]["text"]
+        assert text.startswith("running ")
+        pid = int(next(ln for ln in _body(text) if ln.isdigit()))
+        os.kill(pid, 0)  # alive while the server runs
+        proc.stdin.close()
+        proc.wait(timeout=15)
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        raise AssertionError("background run survived stdin EOF")
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 # --- _preview ---
@@ -132,6 +435,8 @@ def test_handle_initialize():
     r = _sync_handle("initialize", {})
     assert r["protocolVersion"] == "2025-06-18"
     assert "tools" in r["capabilities"]
+    assert "resources" in r["capabilities"]
+    assert r["serverInfo"]["version"] == "0.8.1"
     assert r["serverInfo"]["name"] == "py-scratch"
 
 
@@ -145,7 +450,11 @@ def test_handle_tools_list():
     assert r["tools"][0]["name"] == "run_python_script"
     schema = r["tools"][0]["inputSchema"]
     assert "code" in schema["properties"]
-    assert "intent" in schema["required"]
+    assert "time_estimate" in schema["properties"]
+    assert "timeout" not in schema["properties"]
+    assert "run_id" in schema["properties"] and "action" in schema["properties"]
+    assert "required" not in schema  # code/intent are not needed with run_id
+    assert "estimate" in r["tools"][0]["description"]
 
 
 def test_handle_ping():
@@ -382,10 +691,10 @@ async def test_tool_call_with_wrong_arg_name_still_responds():
     })
     assert len(sent) == 1
     assert sent[0]["id"] == 1
-    body = json.loads(sent[0]["result"]["content"][0]["text"])
-    assert body["exit_code"] == 0
-    assert "aliased" in body["stdout_preview"]
-    assert any("script" in n and "code" in n for n in body["argument_notes"])
+    text = sent[0]["result"]["content"][0]["text"]
+    assert text.startswith("ok exit=0 ")
+    assert "aliased" in text
+    assert "note: " in text and "'script' as 'code'" in text
 
 
 async def test_tool_call_missing_code_responds_with_error():
@@ -455,17 +764,19 @@ def test_describe_exit_classifications():
 
 
 async def test_timeout_is_reported_as_timeout_not_crash():
-    r = await run_python_script(intent="hang", code="import time; time.sleep(30)", timeout=2)
-    assert r["status"] == "timeout"
-    assert "timeout" in r["explanation"]
+    r = await run_python_script(intent="hang", code="import time; time.sleep(30)", time_estimate=0.1)
+    run = _run_of(r)
+    await asyncio.wait_for(run.done.wait(), 10)
+    assert run.state == "timeout"
+    assert "hard limit" in run.explanation
 
 
 async def test_signal_death_is_reported_as_crash():
     r = await run_python_script(
         intent="crash", code="import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
     )
-    assert r["status"] == "crashed"
-    assert "SIGKILL" in r["explanation"]
+    assert r.startswith("crashed ")
+    assert "SIGKILL" in r
 
 
 async def test_crash_with_output_is_not_retried():
@@ -474,24 +785,26 @@ async def test_crash_with_output_is_not_retried():
         code="import os, signal, sys; print('side effect'); sys.stdout.flush();"
              " os.kill(os.getpid(), signal.SIGKILL)",
     )
-    assert r["status"] == "crashed"
-    assert "crash_retry_of" not in r
+    assert r.startswith("crashed ")
+    assert "retry of" not in r
 
 
 def test_normalise_args_coerces_loose_types():
-    intent, code, deps, timeout, head, tail = server_mod._normalise_args(
-        None, "print(1)", "httpx", "45", None, "3"
+    intent, code, deps, estimate, head, tail = server_mod._normalise_args(
+        None, "print(1)", "httpx", "4.5", None, "3"
     )
     assert intent == ""
     assert deps == ["httpx"]
-    assert timeout == 45
+    assert estimate == 4.5
     assert head == 0
     assert tail == 3
 
 
 def test_normalise_args_clamps_nonsense():
-    _, _, _, timeout, _, _ = server_mod._normalise_args("i", "c", [], -5, 0, 5)
-    assert timeout == 1
+    _, _, _, estimate, _, _ = server_mod._normalise_args("i", "c", [], -5, 0, 5)
+    assert estimate == 0.1
+    _, _, _, estimate, _, _ = server_mod._normalise_args("i", "c", [], "soon", 0, 5)
+    assert estimate == 10
 
 
 def test_read_log_survives_bad_encoding(tmp_path):
@@ -755,32 +1068,21 @@ def test_py_scratch_dir_env_overrides(tmp_path):
         os.environ.pop("PY_SCRATCH_DIR", None)
 
 
-async def test_timeout_kills_the_grandchild_interpreter():
-    # The direct child is `uv run`; the interpreter running the script is its child.
-    # Killing only uv would leave that interpreter alive forever.
-    r = await run_python_script(
-        intent="orphan check",
-        code="import os, sys, time; print(os.getpid()); sys.stdout.flush(); time.sleep(120)",
-        timeout=3,
-    )
-    assert r["status"] == "timeout"
-    child_pid = int(r["stdout_preview"].strip().split("\n")[0])
-    await asyncio.sleep(0.5)
-    try:
-        os.kill(child_pid, 0)
-    except ProcessLookupError:
-        return
-    raise AssertionError(f"interpreter {child_pid} survived the timeout kill")
-
-
 async def test_crash_with_no_output_is_retried_once():
     r = await run_python_script(
         intent="silent crash",
         code="import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
     )
-    assert r["status"] == "crashed"
-    assert "crash_retry_of" in r
-    assert "reproduced on retry" in r["explanation"]
+    assert r.startswith("crashed ")
+    assert re.search(r"retry of run \d+", r.splitlines()[0])
+    assert "reproduced on retry" in r
+
+
+async def test_import_error_auto_installs_dependency():
+    # a package that is certainly not importable; the inferred dep is attempted
+    # (and fails to resolve), which is enough to show the retry was made
+    r = await run_python_script(intent="t", code="import definitely_not_a_module_xyz")
+    assert "auto-installed definitely_not_a_module_xyz" in r.splitlines()[0]
 
 
 def test_clear_is_followed_exactly(tmp_path):

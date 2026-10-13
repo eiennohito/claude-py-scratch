@@ -1,10 +1,22 @@
 {
   "name": "py-scratch",
   "description": "Python scratch file execution environment for Claude Code. Replaces python -c with a proper run_python_script tool — no shell escaping, automatic dependency resolution, sandboxed execution, and persistent output.",
-  "version": "0.7.0",
+  "version": "0.8.1",
   "author": {
     "name": "Arseny Tolmachev"
   },
   "repository": "https://github.com/eiennohito/py-scratch",
-  "license": "MIT"
+  "license": "MIT",
+  "mcpServers": {
+    "py-scratch": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "py-scratch"
+      ]
+    }
+  }
 }

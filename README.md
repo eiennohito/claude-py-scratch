@@ -22,16 +22,23 @@ claude plugin add /path/to/py-scratch
 
 This registers the MCP server, hook, and skill in one step:
 
-- **MCP server** -- `run_python_script` tool, registered via `.mcp.json`
+- **MCP server** -- `run_python_script` tool, registered via `mcpServers` in `.claude-plugin/plugin.json`
+  (not a root `.mcp.json`, which Claude Code would also load as a project server when working in this repo)
 - **Hooks**
-  - rejects `Bash(python -c ...)` when code exceeds ~2 lines, tells the agent to use `run_python_script`
-  - injects a short usage instruction at session start
+  - blocks throwaway Python via Bash (multi-line `python -c`, `python -` heredocs, any interpreter flags):
+    snippets that write files are pointed at the Edit tool, everything else at `run_python_script`
+    with the exact `ToolSearch` line to load it. `python3 script.py` stays allowed.
+  - dry-runs `sed -i` / `perl -pi`; if the edit would change more than max(20 lines, 10% of the file),
+    blocks once with the diff stats — re-running the identical command confirms it
+  - after every Bash command in a git repo, reports to the agent if that command changed a lot
+    of tracked lines (>200 total, or >50% of a file), with the `git checkout` to undo it
+  - injects a short usage instruction at session start (also after `/clear`)
   - hands the real session identity to the MCP server, so execution artifacts land in the right session directory (see [How the session is identified](#how-the-session-is-identified))
 - **Skill** -- teaches the agent when to use the tool vs plain `python -c`
 
 ### Manual (MCP server only)
 
-Add to `.mcp.json` (project) or `~/.claude.json` (global):
+Add to a project `.mcp.json` or `~/.claude.json` (global):
 
 ```json
 {
@@ -52,41 +59,66 @@ This gives you the tool but not the hook or skill.
 
 ```
 run_python_script(
-  intent: str,             # what the script is for -- required
-  code: str,               # raw Python source -- required
+  intent: str,             # what the script is for
+  code: str,               # raw Python source -- required unless run_id is given
+  time_estimate: float = 10,   # seconds you expect the script to take
   dependencies: str[],     # optional PyPI package names
-  timeout: int = 30,       # seconds
-  head: int = 0,           # lines from start of output in preview
-  tail: int = 5            # lines from end of output in preview
+  head: int = 0,           # lines from start of stdout preview
+  tail: int = 5,           # lines from end of stdout preview
+  run_id: int,             # follow up on a run that returned "running"
+  action: "wait" | "kill"  # with run_id (default "wait")
 )
 ```
 
-Returns:
+`time_estimate` replaces the old `timeout` (still accepted as an alias, with a note).
+It is an estimate, not a limit: the hard kill is at 10x the estimate, and the clock
+starts when the script starts, not while uv installs dependencies.
 
-```json
-{
-  "execution_id": "0007",
-  "exit_code": 0,
-  "status": "ok",
-  "duration_ms": 457,
-  "stdout_preview": "...",
-  "stderr_preview": "",
-  "stdout_path": "/tmp/pyscratch-1000/myproj-a1b2c3/2026-08-26-14-27-13-3513357/0007/stdout.log",
-  "stderr_path": "/tmp/pyscratch-1000/myproj-a1b2c3/2026-08-26-14-27-13-3513357/0007/stderr.log"
-}
+If the script is still running when the estimate is up, the call **returns instead of
+blocking**: the server samples the interpreter's stack (a small bootstrap registers
+`faulthandler` on `SIGUSR1`, so this works even inside a C extension), writes it to
+`trace`, and reports the state `running` and the line being executed. The script keeps
+running in the background. `run_id` with `action="wait"` blocks for another estimate
+period (or a new `time_estimate`) and samples again; `action="kill"` kills the
+process group. A script expected to take a second that is still running after ten is
+nearly always an infinite loop, and this surfaces it at once instead of after a
+ten-minute timeout. Unknown `run_id` is an error.
+
+The result is plain text, not JSON. The first line is the status:
+
+```
+ok exit=0 0.21s · run 42 · /tmp/pyscratch-1000/myproj-a1b2c3/2026-08-26-14-27-13-3513357/42/{code.py,stdout,stderr}
+failed exit=1 ...      crashed exit=137 ...      killed ...      timeout (hard limit 100s) ...
+running 3.1s (estimate 1s, hard limit 10s) · run 42 · <dir>/{code.py,stdout,stderr,trace}
+at line 14: if key in seen_list:
+<last stdout lines>
+→ run_python_script(run_id=42, action="wait"|"kill")
 ```
 
-`status` is one of `ok`, `failed`, `timeout`, `crashed`, `not_started`; anything
-other than `ok` also carries an `explanation`. See [Reliability](#reliability).
+Below the status come the stdout preview, and the stderr preview when the run did not
+succeed (an `ok` run with stderr output just notes the line count). Extras appear only
+when present: `note:` (argument corrections), `auto-installed <pkg>`, `retry of run N`,
+and an explanation for `crashed`/`not_started`. `status` is one of `ok`, `failed`,
+`timeout`, `killed`, `crashed`, `not_started`. See [Reliability](#reliability).
 
-By default, the last 5 lines of each stream are returned as preview. Use `head`/`tail` to control what's included. Full output at the file paths -- the agent uses its own Read/Grep tools when it needs more.
+By default, the last 5 lines of stdout are shown. Use `head`/`tail` to control what's
+included. Full output is in the run directory -- the agent uses its own Read/Grep tools
+when it needs more.
 
-**Dependency auto-resolution:** if the script fails with `ModuleNotFoundError` and no deps were declared, the server infers the package name (handling mismatches like `cv2` -> `opencv-python`, `PIL` -> `Pillow`) and retries automatically.
+**Dependency auto-resolution:** if the script fails with `ModuleNotFoundError` and no deps were declared, the server infers the package name (handling mismatches like `cv2` -> `opencv-python`, `PIL` -> `Pillow`) and retries automatically. Like the crash retry, this applies only to runs that finished within their estimate.
 
 **How it runs:**
-1. Writes code to `{output_dir}/{execution_id}/script.py` with PEP 723 inline metadata for any declared deps
-2. Executes via `uv run`, stdout/stderr streamed directly to files
-3. Timeout enforced via subprocess
+1. Writes code to `{output_dir}/{run_id}/code.py` with PEP 723 inline metadata for any declared deps
+2. Executes it through a thin bootstrap via `uv run`, stdout/stderr streamed directly to files (stdout is line-buffered so progress shows up in `running` previews)
+3. A background supervisor per run enforces the hard limit; runs are tracked in a registry
+
+### Run status resource
+
+The server declares the MCP `resources` capability. `resources/list` returns active
+and recent runs, and `resources/read` of `pyscratch://runs/<id>/status` (template
+`pyscratch://runs/{id}/status`) returns JSON: `state`, `elapsed`, `estimate`,
+`hard_limit`, `exit_code`, `pgid`, `last_frame` (the line the last stack sample found),
+and `dir`. Code, stdout and stderr are files only.
 
 ## Project context
 
@@ -128,10 +160,11 @@ With a project context set, the agent can write `from myproj import ...` in any 
 Each execution produces:
 
 ```
-{artifact_root}/{execution_id}/
-  script.py    # the code that ran
-  stdout.log   # full stdout
-  stderr.log   # full stderr
+{artifact_root}/{run_id}/
+  code.py      # the code that ran
+  stdout       # full stdout
+  stderr       # full stderr
+  trace        # last stack sample (runs that outlived their estimate)
   meta.json    # exit code, status, duration, deps, timestamp
 ```
 
@@ -226,7 +259,8 @@ backgrounds it after 120s and gives up only after a 30-minute idle timeout).
 - Any exception in the handler is returned as an `isError` result with the
   traceback and the server log path, never dropped.
 - Near-miss argument names are mapped onto the schema (`script`/`source` → `code`,
-  `deps`/`packages` → `dependencies`) and reported back in `argument_notes`;
+  `deps`/`packages` → `dependencies`, `timeout` → `time_estimate`) and reported back
+  in a `note:` line;
   genuinely unusable arguments produce an error result explaining the schema.
 - Unknown methods and internal failures get proper JSON-RPC error responses.
 - Oversized or malformed input lines are logged and skipped instead of taking down
@@ -238,8 +272,9 @@ Child processes are handled defensively too:
   A crash reports the signal and a likely cause (`SIGKILL` → OOM killer,
   `SIGSEGV` → native extension, ...). Because the child is `uv run`, signal deaths
   arrive as exit code `128+N` rather than a negative status; both are decoded.
-- Scripts run in their own process group, so a timeout kills the interpreter too
-  rather than orphaning it behind `uv`.
+- Scripts run in their own process group, so a kill (hard limit, `action="kill"`,
+  stdin EOF or SIGTERM on the server, or a `notifications/cancelled` for the call that
+  is blocking on the run) takes the interpreter too rather than orphaning it behind `uv`.
 - A child that dies on a fatal signal *without producing any output* is retried
   once — it never got far enough to have side effects, and the cause is usually
   transient. A crash that reproduces is reported as such.
